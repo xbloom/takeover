@@ -1,0 +1,93 @@
+# Rust/Cargo
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+.cache/
+
+# Environment variables
+.env
+.env.local
+.env.production
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Package files
+*.tar.gz
+*.zip
+*.rar
+
+# Configuration files (may contain sensitive data)
+config.json
+settings.json
+
+# Test artifacts
+test_output/
+coverage/
+
+# Documentation build
+/docs/_build/
+/book/
+
+# Takeover-specific files
+/tmp/takeover_*.conf
+/tmp/*_main.conf
+test_*.py
+test_*.sh
+*.pid
+
+# Runtime files
+*.sock
+*.lock
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Profiling data
+*.prof
+callgrind.out.*
+perf.data*
+
+# Core dumps
+core
+core.*

@@ -1,0 +1,57 @@
+{
+  "targets": {
+    "firefox": {
+      "name": "firefox",
+      "path_patterns": [
+        "**/firefox*",
+        "**/Firefox*",
+        "**/Mozilla Firefox*"
+      ],
+      "proxy_config": {
+        "url": "socks5://127.0.0.1:1080",
+        "proxy_type": "Socks5",
+        "auth": null
+      },
+      "enabled": true
+    },
+    "chrome": {
+      "name": "chrome",
+      "path_patterns": [
+        "**/chrome*",
+        "**/Chrome*",
+        "**/Google Chrome*"
+      ],
+      "proxy_config": {
+        "url": "socks5://127.0.0.1:1080",
+        "proxy_type": "Socks5",
+        "auth": null
+      },
+      "enabled": true
+    },
+    "curl": {
+      "name": "curl",
+      "path_patterns": [
+        "**/curl*"
+      ],
+      "proxy_config": {
+        "url": "http://127.0.0.1:8080",
+        "proxy_type": "Http",
+        "auth": {
+          "username": "user",
+          "password": "pass"
+        }
+      },
+      "enabled": true
+    }
+  },
+  "global_settings": {
+    "log_level": "info",
+    "bind_interface": null,
+    "dns_servers": [
+      "8.8.8.8",
+      "8.8.4.4"
+    ],
+    "enable_ipv6": false,
+    "connection_timeout": 30
+  }
+}
