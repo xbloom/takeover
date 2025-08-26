@@ -9,8 +9,9 @@ mod error;
 mod process_monitor;
 mod network_interceptor;
 mod proxy_manager;
+mod socks5;
 mod utils;
-
+mod status;
 #[cfg(target_os = "macos")]
 pub mod transparent_proxy;
 

@@ -1,11 +1,28 @@
 use crate::config::ProxyConfig;
+use crate::socks5::{Socks5Client, DataForwarder};
+use crate::utils;
+
 use anyhow::Result;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::process::Command;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use tracing::{info, warn, error, debug};
 use std::path::PathBuf;
+
+// Application constants
+const DEFAULT_PORTS: &[u16] = &[80, 443, 8080, 3000, 5000, 8000];
+const COMMON_WEB_PORTS: &[u16] = &[80, 443, 8080];
+const EXTENDED_WEB_PORTS: &[u16] = &[80, 443, 8080, 3000, 5000];
+const MAX_READINESS_ATTEMPTS: u32 = 30;
+const BASE_READINESS_DELAY_MS: u64 = 100;
+const MAX_READINESS_DELAY_MS: u64 = 500;
+const PEEK_TIMEOUT_MS: u64 = 500;
+const PEEK_BUFFER_SIZE: usize = 4096;
+const PROXY_BUFFER_SIZE: usize = 8192;
+const DEFAULT_HTTP_PORT: u16 = 80;
+const DEFAULT_HTTPS_PORT: u16 = 443;
+const ANCHOR_NAME: &str = "takeover_transparent";
+const TEMP_DIR: &str = "/tmp";
 
 /// 代理模式选项
 #[derive(Debug, Clone)]
@@ -20,9 +37,8 @@ pub enum ProxyMode {
 
 impl Default for ProxyMode {
     fn default() -> Self {
-        // 默认使用全局模式，拦截常用端口
         Self::Global { 
-            ports: vec![80, 443, 8080, 3000, 5000, 8000] 
+            ports: DEFAULT_PORTS.to_vec()
         }
     }
 }
@@ -53,6 +69,7 @@ struct PfctlRuleManager {
     anchor_name: String,
     rule_file_path: PathBuf,
     active_rules: Vec<String>,
+    using_alternative_method: bool,
 }
 
 #[derive(Debug)]
@@ -70,7 +87,7 @@ impl TransparentProxy {
             proxy_config,
             proxy_mode,
             local_proxy_server: None,
-            pfctl_rules: PfctlRuleManager::new("takeover_transparent"),
+            pfctl_rules: PfctlRuleManager::new(ANCHOR_NAME),
             readiness_checker: ReadinessChecker::new(),
         }
     }
@@ -217,15 +234,15 @@ impl TransparentProxy {
 
     /// 处理透明代理连接
     async fn handle_transparent_connection(
-        mut client_stream: tokio::net::TcpStream,
+        client_stream: tokio::net::TcpStream,
         proxy_config: ProxyConfig,
     ) -> Result<()> {
         debug!("Handling transparent proxy connection");
 
         // 读取第一部分数据以获取目标地址（从HTTP Host头）
-        let mut buffer = vec![0u8; 4096];
+        let mut buffer = vec![0u8; PEEK_BUFFER_SIZE];
         let n = match tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_millis(PEEK_TIMEOUT_MS),
             client_stream.peek(&mut buffer)
         ).await {
             Ok(Ok(n)) if n > 0 => n,
@@ -248,10 +265,10 @@ impl TransparentProxy {
             .map_err(|e| anyhow::anyhow!("Failed to connect to SOCKS5 proxy: {}", e))?;
 
         // 进行完整的SOCKS5握手（包括CONNECT请求）
-        Self::perform_full_socks5_handshake(&mut proxy_stream, &proxy_config, &target_host, target_port).await?;
+        Socks5Client::connect(&mut proxy_stream, &proxy_config, &target_host, target_port).await?;
 
         // 双向透明转发数据
-        Self::bidirectional_copy(client_stream, proxy_stream).await?;
+        DataForwarder::bidirectional_copy(client_stream, proxy_stream, PROXY_BUFFER_SIZE).await?;
 
         debug!("Transparent connection completed");
         Ok(())
@@ -307,9 +324,9 @@ impl TransparentProxy {
                 // 没有端口，根据方法推断默认端口
                 let default_port = if url_or_path.starts_with("https://") || 
                                      request_str.contains("443") {
-                    443
+                    DEFAULT_HTTPS_PORT
                 } else {
-                    80
+                    DEFAULT_HTTP_PORT
                 };
                 
                 return Ok((host_part.to_string(), default_port));
@@ -320,212 +337,12 @@ impl TransparentProxy {
         if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
             if let Ok(url) = url::Url::parse(url_or_path) {
                 let host = url.host_str().unwrap_or("").to_string();
-                let port = url.port().unwrap_or(if url.scheme() == "https" { 443 } else { 80 });
+                let port = url.port().unwrap_or(if url.scheme() == "https" { DEFAULT_HTTPS_PORT } else { DEFAULT_HTTP_PORT });
                 return Ok((host, port));
             }
         }
 
         Err(anyhow::anyhow!("Could not parse target from HTTP request"))
-    }
-
-    /// 完整的SOCKS5握手（包括认证和CONNECT）
-    async fn perform_full_socks5_handshake(
-        stream: &mut tokio::net::TcpStream,
-        proxy_config: &ProxyConfig,
-        target_host: &str,
-        target_port: u16,
-    ) -> Result<()> {
-        debug!("Performing full SOCKS5 handshake to {}:{}", target_host, target_port);
-
-        // 第一步：认证握手
-        Self::perform_socks5_handshake(stream, proxy_config).await?;
-
-        // 第二步：发送CONNECT请求
-        let mut connect_request = vec![0x05, 0x01, 0x00]; // VER, CMD=CONNECT, RSV
-
-        // 地址类型和地址
-        if target_host.parse::<std::net::Ipv4Addr>().is_ok() {
-            // IPv4地址
-            connect_request.push(0x01);
-            let ip: std::net::Ipv4Addr = target_host.parse()?;
-            connect_request.extend_from_slice(&ip.octets());
-        } else if target_host.parse::<std::net::Ipv6Addr>().is_ok() {
-            // IPv6地址
-            connect_request.push(0x04);
-            let ip: std::net::Ipv6Addr = target_host.parse()?;
-            connect_request.extend_from_slice(&ip.octets());
-        } else {
-            // 域名
-            connect_request.push(0x03);
-            connect_request.push(target_host.len() as u8);
-            connect_request.extend_from_slice(target_host.as_bytes());
-        }
-
-        // 端口
-        connect_request.extend_from_slice(&target_port.to_be_bytes());
-
-        stream.write_all(&connect_request).await?;
-
-        // 读取CONNECT响应
-        let mut connect_response = vec![0; 4];
-        stream.read_exact(&mut connect_response).await?;
-
-        if connect_response[0] != 0x05 {
-            return Err(anyhow::anyhow!("Invalid SOCKS5 CONNECT response version"));
-        }
-
-        if connect_response[1] != 0x00 {
-            return Err(anyhow::anyhow!("SOCKS5 CONNECT failed with code: {}", connect_response[1]));
-        }
-
-        // 读取剩余的地址信息（我们不需要使用，但必须读取完整）
-        match connect_response[3] {
-            0x01 => {
-                // IPv4: 4字节地址 + 2字节端口
-                let mut addr_info = vec![0; 6];
-                stream.read_exact(&mut addr_info).await?;
-            }
-            0x03 => {
-                // 域名: 1字节长度 + 域名 + 2字节端口
-                let mut len_buf = vec![0; 1];
-                stream.read_exact(&mut len_buf).await?;
-                let len = len_buf[0] as usize;
-                let mut addr_info = vec![0; len + 2];
-                stream.read_exact(&mut addr_info).await?;
-            }
-            0x04 => {
-                // IPv6: 16字节地址 + 2字节端口
-                let mut addr_info = vec![0; 18];
-                stream.read_exact(&mut addr_info).await?;
-            }
-            _ => {
-                return Err(anyhow::anyhow!("Unsupported address type in SOCKS5 response"));
-            }
-        }
-
-        debug!("✅ SOCKS5 CONNECT to {}:{} completed successfully", target_host, target_port);
-        Ok(())
-    }
-
-    /// SOCKS5握手处理（仅认证部分）
-    async fn perform_socks5_handshake(
-        stream: &mut tokio::net::TcpStream,
-        proxy_config: &ProxyConfig,
-    ) -> Result<()> {
-        debug!("Performing SOCKS5 authentication handshake");
-
-        // 发送认证方法选择
-        let greeting = if proxy_config.auth_tuple().is_some() {
-            vec![0x05, 0x02, 0x00, 0x02] // 版本5，支持无认证和用户名密码
-        } else {
-            vec![0x05, 0x01, 0x00] // 版本5，只支持无认证
-        };
-
-        stream.write_all(&greeting).await?;
-
-        let mut response = vec![0; 2];
-        stream.read_exact(&mut response).await?;
-
-        if response[0] != 0x05 {
-            return Err(anyhow::anyhow!("Invalid SOCKS5 response version: {}", response[0]));
-        }
-
-        match response[1] {
-            0x00 => {
-                debug!("SOCKS5: No authentication required");
-            }
-            0x02 => {
-                debug!("SOCKS5: Username/password authentication required");
-                if let Some((username, password)) = proxy_config.auth_tuple() {
-                    Self::perform_socks5_auth(stream, &username, &password).await?;
-                } else {
-                    return Err(anyhow::anyhow!("SOCKS5 requires authentication but none provided"));
-                }
-            }
-            0xFF => {
-                return Err(anyhow::anyhow!("SOCKS5: No acceptable authentication methods"));
-            }
-            _ => {
-                return Err(anyhow::anyhow!("SOCKS5: Unsupported authentication method: {}", response[1]));
-            }
-        }
-
-        debug!("✅ SOCKS5 authentication completed successfully");
-        Ok(())
-    }
-
-    /// SOCKS5用户名密码认证
-    async fn perform_socks5_auth(
-        stream: &mut tokio::net::TcpStream,
-        username: &str,
-        password: &str,
-    ) -> Result<()> {
-        debug!("Performing SOCKS5 username/password authentication");
-
-        let mut auth_request = vec![0x01]; // 认证子协议版本
-        auth_request.push(username.len() as u8);
-        auth_request.extend_from_slice(username.as_bytes());
-        auth_request.push(password.len() as u8);
-        auth_request.extend_from_slice(password.as_bytes());
-
-        stream.write_all(&auth_request).await?;
-
-        let mut auth_response = vec![0; 2];
-        stream.read_exact(&mut auth_response).await?;
-
-        if auth_response[1] != 0x00 {
-            return Err(anyhow::anyhow!("SOCKS5 authentication failed"));
-        }
-
-        debug!("✅ SOCKS5 authentication successful");
-        Ok(())
-    }
-
-    /// 双向数据转发
-    async fn bidirectional_copy(
-        client_stream: tokio::net::TcpStream,
-        proxy_stream: tokio::net::TcpStream,
-    ) -> Result<()> {
-        let (mut client_read, mut client_write) = client_stream.into_split();
-        let (mut proxy_read, mut proxy_write) = proxy_stream.into_split();
-
-        let client_to_proxy = tokio::spawn(async move {
-            let mut buffer = vec![0; 8192];
-            loop {
-                match client_read.read(&mut buffer).await {
-                    Ok(0) => break, // 连接关闭
-                    Ok(n) => {
-                        if proxy_write.write_all(&buffer[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let proxy_to_client = tokio::spawn(async move {
-            let mut buffer = vec![0; 8192];
-            loop {
-                match proxy_read.read(&mut buffer).await {
-                    Ok(0) => break, // 连接关闭
-                    Ok(n) => {
-                        if client_write.write_all(&buffer[..n]).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        // 等待任意一个方向的传输完成
-        tokio::select! {
-            _ = client_to_proxy => debug!("Client to proxy transfer completed"),
-            _ = proxy_to_client => debug!("Proxy to client transfer completed"),
-        }
-
-        Ok(())
     }
 
     /// 验证整个系统是否就绪
@@ -567,8 +384,9 @@ impl PfctlRuleManager {
     pub fn new(anchor_name: &str) -> Self {
         Self {
             anchor_name: anchor_name.to_string(),
-            rule_file_path: PathBuf::from(format!("/tmp/{}.conf", anchor_name)),
+            rule_file_path: PathBuf::from(format!("{}/{}.conf", TEMP_DIR, anchor_name)),
             active_rules: Vec::new(),
+            using_alternative_method: false,
         }
     }
 
@@ -580,28 +398,25 @@ impl PfctlRuleManager {
         self.apply_rules(rules).await
     }
     
-    /// 设置进程特定规则 (精确控制)
+    /// Sets up process-specific rules (falls back to global rules on macOS)
     pub async fn setup_process_specific_rules(&mut self, local_proxy_port: u16, _target_pids: Vec<u32>) -> Result<()> {
         info!("Setting up process-specific pfctl rules for proxy port: {}", local_proxy_port);
-        
-        // 注意：macOS的pfctl不能直接基于PID过滤，这里我们使用全局规则
-        // 在实际应用中，可能需要结合其他技术实现真正的PID级别过滤
         warn!("macOS pfctl doesn't support PID-based filtering, falling back to global rules");
         
-        let default_ports = vec![80, 443, 8080];
-        let rules = self.generate_global_rules(local_proxy_port, default_ports);
-        self.apply_rules(rules).await
+        self.setup_fallback_global_rules(local_proxy_port, COMMON_WEB_PORTS).await
     }
     
-    /// 设置基于模式的规则 (智能监控)
+    /// Sets up pattern-based rules (falls back to global rules on macOS)
     pub async fn setup_pattern_based_rules(&mut self, local_proxy_port: u16, _target_patterns: Vec<String>) -> Result<()> {
         info!("Setting up pattern-based pfctl rules for proxy port: {}", local_proxy_port);
-        
-        // 同样，pfctl不支持进程名模式匹配，使用全局规则
         warn!("macOS pfctl doesn't support pattern-based filtering, using global rules");
         
-        let default_ports = vec![80, 443, 8080, 3000, 5000];
-        let rules = self.generate_global_rules(local_proxy_port, default_ports);
+        self.setup_fallback_global_rules(local_proxy_port, EXTENDED_WEB_PORTS).await
+    }
+    
+    /// Common fallback to global rules when process-specific features are not supported
+    async fn setup_fallback_global_rules(&mut self, local_proxy_port: u16, ports: &[u16]) -> Result<()> {
+        let rules = self.generate_global_rules(local_proxy_port, ports.to_vec());
         self.apply_rules(rules).await
     }
     
@@ -611,17 +426,17 @@ impl PfctlRuleManager {
         std::fs::write(&self.rule_file_path, &rules)?;
         debug!("Wrote pfctl rules to: {:?}", self.rule_file_path);
 
-        // 确保pfctl已启用
+        // 确保pfctl已启用并创建anchor
         self.ensure_pfctl_enabled().await?;
 
-        // 直接加载规则到主规则集（不使用anchor，确保规则生效）
-        self.load_rules_directly().await?;
+        // 使用anchor加载规则（安全方式）
+        self.load_rules_with_anchor().await?;
 
         // 验证规则加载成功
-        self.verify_rules_loaded_direct().await?;
+        self.verify_rules_loaded().await?;
 
         self.active_rules = vec![rules];
-        info!("✅ pfctl transparent proxy rules activated");
+        info!("✅ pfctl transparent proxy rules activated with anchor: {}", self.anchor_name);
 
         Ok(())
     }
@@ -665,110 +480,303 @@ impl PfctlRuleManager {
         rules
     }
 
-    /// 确保pfctl已启用
+    /// 确保pfctl已启用并创建anchor
     async fn ensure_pfctl_enabled(&self) -> Result<()> {
-        debug!("Ensuring pfctl is enabled");
+        debug!("Ensuring pfctl is enabled and anchor exists");
 
-        // 启用pfctl
-        let output = tokio::process::Command::new("pfctl")
-            .args(&["-e"])
-            .output()
-            .await?;
+        // 启用pfctl - 使用管理员权限
+        let output = utils::execute_admin_command("pfctl", &["-e"])?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         debug!("pfctl enable output: {}", stderr);
 
-        // 不再需要anchor引用，因为我们直接加载到主规则集
+        // 检查anchor是否存在，如果不存在则创建
+        self.ensure_anchor_exists().await?;
 
         Ok(())
     }
 
-    /// 直接加载规则到主规则集（不使用anchor）
-    async fn load_rules_directly(&self) -> Result<()> {
-        debug!("Loading pfctl rules directly to main ruleset");
+    /// 确保anchor存在并在主配置中引用
+    async fn ensure_anchor_exists(&self) -> Result<()> {
+        debug!("Ensuring anchor '{}' exists and is referenced", self.anchor_name);
 
-        let rule_file_path = self.rule_file_path.to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid rule file path"))?;
+        // 创建一个临时的主配置文件，包含对我们anchor的引用
+        let temp_main_config = format!("{}/pf_main_{}.conf", TEMP_DIR, self.anchor_name);
+        let anchor_reference = format!(
+            "# Temporary pfctl configuration with anchor reference\n\
+             # This allows our anchor to be loaded and take effect\n\
+             \n\
+             # Load anchor for takeover transparent proxy\n\
+             load anchor \"{}\" from \"{}\"\n",
+            self.anchor_name,
+            self.rule_file_path.display()
+        );
 
-        // 重要：使用 -f 会覆盖整个规则集
-        // 但这是确保规则真正生效的唯一方法
-        let output = tokio::process::Command::new("pfctl")
-            .args(&["-f", rule_file_path])
-            .output()
-            .await?;
+        std::fs::write(&temp_main_config, &anchor_reference)?;
+        debug!("Created temporary main config with anchor reference: {}", temp_main_config);
+
+        Ok(())
+    }
+
+    /// 使用正确的方法加载pfctl规则（支持anchor）
+    async fn load_rules_with_anchor(&mut self) -> Result<()> {
+        debug!("Loading pfctl rules with proper anchor support");
+
+        // 方法1：尝试使用anchor + 主配置引用
+        if let Ok(()) = self.try_anchor_with_main_config().await {
+            info!("Successfully loaded rules using anchor method");
+            return Ok(());
+        }
+
+        // 方法2：使用管道方式直接加载（类似您的测试脚本）
+        warn!("Anchor method failed, trying pipe method");
+        self.load_rules_with_pipe().await
+    }
+
+    /// 尝试使用anchor + 主配置引用的方式
+    async fn try_anchor_with_main_config(&mut self) -> Result<()> {
+
+        // 创建主配置文件，引用我们的anchor
+        let main_config_path = format!("{}/main_{}.conf", TEMP_DIR, self.anchor_name);
+        let our_rules = std::fs::read_to_string(&self.rule_file_path)?;
+        
+        // 创建包含anchor引用的主配置
+        let main_config = format!(
+            "# Takeover pfctl configuration with anchor\n\
+             # Generated automatically\n\
+             \n\
+             # Define anchor\n\
+             anchor \"{}\" {{\n\
+             {}\n\
+             }}\n",
+            self.anchor_name,
+            our_rules
+        );
+
+        std::fs::write(&main_config_path, main_config)?;
+        debug!("Created main config with embedded anchor: {}", main_config_path);
+
+        // 加载主配置 - 使用管理员权限
+        let output = utils::execute_admin_command("pfctl", &["-f", &main_config_path])?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("Failed to load pfctl rules: {}", stderr);
-            return Err(anyhow::anyhow!("pfctl rule loading failed: {}", stderr));
+            debug!("Main config loading failed: {}", stderr);
+            return Err(anyhow::anyhow!("Main config loading failed"));
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        debug!("pfctl load output: {}", stdout);
+        // 验证规则是否生效
+        self.verify_rules_active().await?;
         
-        info!("Loaded pfctl rules directly to main ruleset");
-
+        info!("✅ Successfully loaded pfctl rules with anchor");
         Ok(())
     }
 
-    /// 验证规则已加载到主规则集
-    async fn verify_rules_loaded_direct(&self) -> Result<()> {
-        debug!("Verifying pfctl rules are loaded in main ruleset");
+    /// 使用管道方式加载规则（类似测试脚本的方法）
+    async fn load_rules_with_pipe(&mut self) -> Result<()> {
+        debug!("Loading pfctl rules using pipe method");
 
-        // 检查NAT规则（直接从主规则集）
-        let nat_output = tokio::process::Command::new("pfctl")
-            .args(&["-s", "nat"])
-            .output()
-            .await?;
+        let our_rules = std::fs::read_to_string(&self.rule_file_path)?;
+        
+        // 使用 sudo 管道方式加载规则（使用缓存的权限）
+        let mut child = tokio::process::Command::new("sudo")
+            .args(&["pfctl", "-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(our_rules.as_bytes()).await?;
+            stdin.flush().await?;
+        }
+
+        let output = child.wait_with_output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            error!("Pipe method failed: {}", stderr);
+            return Err(anyhow::anyhow!("Pipe method failed: {}", stderr));
+        }
+
+        // 标记使用了备用方法
+        self.using_alternative_method = true;
+        
+        // 验证规则是否生效
+        self.verify_rules_active().await?;
+        
+        info!("✅ Successfully loaded pfctl rules using pipe method");
+        Ok(())
+    }
+
+    /// 验证规则是否真正生效
+    async fn verify_rules_active(&self) -> Result<()> {
+        // 检查NAT规则 - 使用管理员权限
+        let nat_output = utils::execute_admin_command("pfctl", &["-s", "nat"])?;
+
+        if nat_output.status.success() {
+            let nat_rules = String::from_utf8_lossy(&nat_output.stdout);
+            let nat_count = nat_rules.lines()
+                .filter(|l| l.contains("127.0.0.1") && !l.trim().is_empty())
+                .count();
+
+            if nat_count > 0 {
+                debug!("Verified {} active NAT rules", nat_count);
+                return Ok(());
+            }
+        }
+
+        Err(anyhow::anyhow!("No active NAT rules found"))
+    }
+
+    /// 验证规则已加载（智能检测加载方式）
+    async fn verify_rules_loaded_smart(&self) -> Result<()> {
+        debug!("Verifying pfctl rules are loaded (smart detection)");
+
+        // 先尝试检查anchor中的规则
+        let anchor_result = self.check_anchor_rules().await;
+        if anchor_result.is_ok() {
+            return anchor_result;
+        }
+
+        // 如果anchor没有规则，检查主规则集
+        debug!("No rules in anchor, checking main ruleset");
+        self.check_main_ruleset_rules().await
+    }
+
+    /// 检查anchor中的规则
+    async fn check_anchor_rules(&self) -> Result<()> {
+        let nat_output = utils::execute_admin_command("pfctl", &["-a", &self.anchor_name, "-s", "nat"])?;
 
         if !nat_output.status.success() {
-            return Err(anyhow::anyhow!("Failed to query pfctl NAT rules"));
+            return Err(anyhow::anyhow!("Failed to query anchor NAT rules"));
         }
 
         let nat_rules = String::from_utf8_lossy(&nat_output.stdout);
         let nat_count = nat_rules.lines()
             .filter(|l| l.contains("127.0.0.1") && !l.trim().is_empty())
             .count();
-        debug!("Verified NAT rules redirecting to local proxy: {} lines", nat_count);
 
-        // 检查过滤规则（包括route-to）
-        let filter_output = tokio::process::Command::new("pfctl")
-            .args(&["-s", "rules"])
-            .output()
-            .await?;
+        if nat_count > 0 {
+            debug!("Found {} NAT rules in anchor '{}'", nat_count, self.anchor_name);
+            return Ok(());
+        }
+
+        Err(anyhow::anyhow!("No rules found in anchor"))
+    }
+
+    /// 检查主规则集中的规则
+    async fn check_main_ruleset_rules(&self) -> Result<()> {
+        let nat_output = utils::execute_admin_command("pfctl", &["-s", "nat"])?;
+
+        if !nat_output.status.success() {
+            return Err(anyhow::anyhow!("Failed to query main NAT rules"));
+        }
+
+        let nat_rules = String::from_utf8_lossy(&nat_output.stdout);
+        let nat_count = nat_rules.lines()
+            .filter(|l| l.contains("127.0.0.1") && !l.trim().is_empty())
+            .count();
+
+        // 检查过滤规则 - 使用管理员权限
+        let filter_output = utils::execute_admin_command("pfctl", &["-s", "rules"])?;
 
         if !filter_output.status.success() {
-            return Err(anyhow::anyhow!("Failed to query pfctl filter rules"));
+            return Err(anyhow::anyhow!("Failed to query main filter rules"));
         }
 
         let filter_rules = String::from_utf8_lossy(&filter_output.stdout);
         let filter_count = filter_rules.lines()
             .filter(|l| l.contains("route-to") && !l.trim().is_empty())
             .count();
-        debug!("Verified filter rules with route-to: {} lines", filter_count);
+
+        debug!("Found {} NAT rules and {} filter rules in main ruleset", nat_count, filter_count);
 
         if nat_count == 0 {
-            warn!("No NAT rules found in main ruleset - transparent proxy may not work");
+            warn!("No NAT rules found - transparent proxy may not work");
         }
         if filter_count == 0 {
-            warn!("No route-to rules found in main ruleset - outbound traffic may not be intercepted");
+            warn!("No route-to rules found - outbound traffic may not be intercepted");
         }
 
-        Ok(())
+        if nat_count > 0 || filter_count > 0 {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("No relevant rules found in main ruleset"))
+        }
     }
     
-    /// 验证规则已加载（保留用于向后兼容）
+    /// 验证规则已加载（公共接口）
     pub async fn verify_rules_loaded(&self) -> Result<()> {
-        self.verify_rules_loaded_direct().await
+        self.verify_rules_loaded_smart().await
     }
 
-    /// 清理规则
+    /// 清理规则（智能清理方式）
     pub async fn cleanup_rules(&mut self) -> Result<()> {
-        info!("Cleaning up pfctl rules");
+        if self.using_alternative_method {
+            info!("Cleaning up pfctl rules using alternative cleanup method");
+            self.cleanup_alternative_rules().await
+        } else {
+            info!("Cleaning up pfctl rules from anchor: {}", self.anchor_name);
+            self.cleanup_anchor_rules().await
+        }
+    }
 
-        // 刷新主规则集中的所有规则
-        // 注意：这会清除所有规则，包括系统规则
-        // 更安全的方法是保存原始规则并恢复
+    /// 清理anchor规则
+    async fn cleanup_anchor_rules(&mut self) -> Result<()> {
+        // 只清理我们的anchor，不影响系统规则 - 使用管理员权限
+        let output = utils::execute_admin_command("pfctl", &["-a", &self.anchor_name, "-F", "all"])?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            warn!("Failed to flush pfctl rules from anchor '{}': {}", self.anchor_name, stderr);
+        } else {
+            debug!("Successfully flushed pfctl rules from anchor: {}", self.anchor_name);
+        }
+
+        self.cleanup_common_files().await?;
+        info!("✅ pfctl anchor rules cleanup completed");
+        Ok(())
+    }
+
+    /// 清理备用方法的规则
+    async fn cleanup_alternative_rules(&mut self) -> Result<()> {
+        // 尝试恢复备份的规则
+        let backup_file = format!("{}/pf_backup_{}.conf", TEMP_DIR, self.anchor_name);
+        
+        if std::path::Path::new(&backup_file).exists() {
+            debug!("Restoring original pfctl rules from backup");
+            let output = tokio::process::Command::new("pfctl")
+                .args(&["-f", &backup_file])
+                .output()
+                .await?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("Failed to restore original rules: {}", stderr);
+                // 如果恢复失败，至少清空规则
+                self.emergency_clear_rules().await?;
+            } else {
+                info!("Successfully restored original pfctl rules");
+            }
+
+            // 删除备份文件
+            std::fs::remove_file(&backup_file).ok();
+        } else {
+            warn!("No backup found, performing emergency cleanup");
+            self.emergency_clear_rules().await?;
+        }
+
+        self.cleanup_common_files().await?;
+        self.using_alternative_method = false;
+        info!("✅ pfctl alternative rules cleanup completed");
+        Ok(())
+    }
+
+    /// 紧急清空规则
+    async fn emergency_clear_rules(&self) -> Result<()> {
+        warn!("Performing emergency pfctl rules clear");
         let output = tokio::process::Command::new("pfctl")
             .args(&["-F", "all"])
             .output()
@@ -776,23 +784,37 @@ impl PfctlRuleManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            warn!("Failed to flush pfctl rules: {}", stderr);
-        } else {
-            debug!("Successfully flushed pfctl rules");
+            error!("Emergency clear failed: {}", stderr);
         }
-
-        // 保留规则文件用于调试
-        debug!("Keeping rule file for debugging: {:?}", self.rule_file_path);
-
-        self.active_rules.clear();
-        info!("✅ pfctl rules cleanup completed");
 
         Ok(())
     }
 
-    /// 紧急清理（同步版本，用于Drop）
+    /// 清理通用文件
+    async fn cleanup_common_files(&mut self) -> Result<()> {
+        // 清理规则文件
+        if self.rule_file_path.exists() {
+            if let Err(e) = std::fs::remove_file(&self.rule_file_path) {
+                warn!("Failed to remove rule file {:?}: {}", self.rule_file_path, e);
+            } else {
+                debug!("Removed rule file: {:?}", self.rule_file_path);
+            }
+        }
+
+        // 清理临时文件
+        let combined_config = format!("{}/combined_{}.conf", TEMP_DIR, self.anchor_name);
+        std::fs::remove_file(&combined_config).ok();
+
+        let temp_main_config = format!("{}/pf_main_{}.conf", TEMP_DIR, self.anchor_name);
+        std::fs::remove_file(&temp_main_config).ok();
+
+        self.active_rules.clear();
+        Ok(())
+    }
+
+    /// 紧急清理（异步版本，用于Drop trait）
     pub async fn emergency_cleanup(&mut self) -> Result<()> {
-        warn!("Performing emergency pfctl cleanup");
+        warn!("Performing emergency pfctl cleanup for anchor: {}", self.anchor_name);
         self.cleanup_rules().await
     }
 }
@@ -806,8 +828,8 @@ impl ReadinessChecker {
     pub async fn wait_for_proxy_ready(&self, port: u16) -> Result<()> {
         info!("Waiting for proxy server readiness on port: {}", port);
         
-        let max_attempts = 30;
-        let base_delay = Duration::from_millis(100);
+        let max_attempts = MAX_READINESS_ATTEMPTS;
+        let base_delay = Duration::from_millis(BASE_READINESS_DELAY_MS);
         
         for attempt in 1..=max_attempts {
             match self.check_proxy_connectivity(port).await {
@@ -824,7 +846,7 @@ impl ReadinessChecker {
                     // 指数退避，但有上限
                     let delay = std::cmp::min(
                         base_delay * (2_u32.pow(attempt / 5)), 
-                        Duration::from_millis(500)
+                        Duration::from_millis(MAX_READINESS_DELAY_MS)
                     );
                     tokio::time::sleep(delay).await;
                     continue;

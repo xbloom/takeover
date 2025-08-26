@@ -2,13 +2,12 @@ use anyhow::Result;
 use std::process::Command;
 use tokio::time::{sleep, Duration};
 use tracing::error;
-use clap::{Arg, Command as ClapCommand, ArgMatches};
 
 // 导入我们的模块
-use takeover::config::{ProxyConfig, ProxyType};
+use takeover::config::{Config, ProxyConfig, ProxyType};
 
 #[cfg(target_os = "macos")]
-use takeover::transparent_proxy::{TransparentProxy, ProxyMode};
+use takeover::{TransparentServer, RoutingEngine};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,12 +25,13 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // 检查权限
-    if !check_root_privileges() {
-        error!("❌ 此程序需要管理员权限来修改pfctl规则");
-        println!("\n💡 请使用 sudo 运行此程序:");
-        println!("💡 sudo cargo run --example transparent_proxy_demo");
-        return Ok(());
+    // 检查当前权限状态
+    if check_root_privileges() {
+        println!("✅ 已具备管理员权限");
+    } else {
+        println!("ℹ️  当前以普通用户身份运行");
+        println!("💡 系统会在需要时自动申请管理员权限（创建专用用户等操作）");
+        println!("🔐 请准备在弹出的对话框中确认权限申请");
     }
 
     // 检查系统依赖
@@ -56,51 +56,99 @@ async fn main() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 async fn run_transparent_proxy_demo(proxy_config: ProxyConfig) -> Result<()> {
-    // 创建透明代理实例
-    let mut transparent_proxy = TransparentProxy::new(proxy_config);
+    // 加载或创建配置
+    let config = Config::load_or_create("config.json").unwrap_or_else(|_| Config::default());
+    
+    // 创建路由引擎
+    let routing_engine = RoutingEngine::new(&config);
+    
+    // 显示路由规则统计
+    let stats = routing_engine.get_stats();
+    println!("\n📋 路由规则已加载:");
+    println!("   - 进程: {}", stats.total_processes);
+    println!("   - 进程路径: {}", stats.total_process_paths);
+    println!("   - 域名: {}", stats.total_domains);
+    println!("   - URL模式: {}", stats.total_url_patterns);
+    println!("   - 端口: {}", stats.total_ports);
+    println!("   - IP范围: {}", stats.total_ip_ranges);
+    println!("   - URL重写: {}", stats.total_url_rewrites);
+
+    // 创建透明代理服务器
+    // 用户管理现在是自动的，系统会创建专用的代理用户来避免循环
+    let mut transparent_server = TransparentServer::new(proxy_config, routing_engine);
+    
+    // 定义要拦截的端口
+    let intercepted_ports = [80, 443, 8080];
 
     // 启动透明代理系统
     println!("\n🚀 启动透明代理系统...");
-    match transparent_proxy.start().await {
-        Ok(()) => {
-            if let Some(port) = transparent_proxy.get_local_port() {
-                println!("✅ 透明代理系统已启动！本地代理端口: {}", port);
-            } else {
-                println!("✅ 透明代理系统已启动！");
+    println!("🔌 拦截端口: {:?}", intercepted_ports);
+    
+    // 设置信号处理器 - 在单独的任务中处理
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        println!("\n🛑 收到Ctrl+C信号，准备停止...");
+        let _ = tx.send(());
+    });
+    
+    // 在单独的任务中启动服务器
+    let server_handle = tokio::spawn(async move {
+        match transparent_server.start(&intercepted_ports).await {
+            Ok(()) => {
+                println!("✅ 透明代理服务器正常停止");
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ 透明代理服务器错误: {}", e);
+                Err(e)
             }
         }
-        Err(e) => {
-            error!("❌ 启动透明代理系统失败: {}", e);
-            println!("\n💡 可能的解决方案:");
-            println!("   1. 确保有一个SOCKS5代理运行在127.0.0.1:1080");
-            println!("   2. 尝试启动SSH隧道: ssh -D 1080 user@remote-server");
-            println!("   3. 或使用其他SOCKS5代理工具");
-            return Ok(());
-        }
-    }
+    });
+    
+    println!("✅ 透明代理系统已启动！");
+    println!("\n💡 系统说明:");
+    println!("   🌐 全局拦截HTTP/HTTPS流量 (端口 80,443,8080)");
+    println!("   🎯 智能路由决策 - 根据域名、URL模式匹配");
+    println!("   🔀 匹配的流量通过SOCKS5代理转发");
+    println!("   🔗 不匹配的流量直接连接");
+    println!("   🛡️ 循环防护 - 自动创建专用用户，使用用户过滤器避免循环");
+    println!("   👤 专用用户: 系统会自动创建 '_takeover_proxy' 用户用于socket绑定");
+    println!("   🔐 权限管理: 首次创建用户时会弹出权限确认对话框");
 
     // 提示用户准备测试
     println!("\n🧪 准备进行透明代理测试...");
-    println!("⚠️  注意: 所有HTTP/HTTPS流量现在都将通过代理");
+    println!("⚠️  注意: HTTP/HTTPS流量现在会根据规则智能路由");
     
     // 自动运行测试
     println!("\n开始自动测试...");
     run_transparent_tests().await?;
 
-    // 等待用户决定何时停止
+    // 等待用户决定何时停止或收到信号
     println!("\n🏁 测试完成！");
     println!("透明代理仍在运行，您可以:");
     println!("  • 在其他终端窗口测试任何网络命令");
     println!("  • curl https://httpbin.org/ip");
-    println!("  • node -e \"console.log('test')\"");
-    println!("  • 按 Enter 停止透明代理系统");
+    println!("  • curl https://api.openai.com/v1/models");
+    println!("  • node -e \"require('https').get('https://github.com/', res => console.log('GitHub:', res.statusCode))\"");
+    println!("  • 按 Enter 停止透明代理系统，或使用 Ctrl+C");
     
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    // 等待用户输入或信号
+    tokio::select! {
+        _ = async {
+            let mut input = String::new();
+            std::io::stdin().read_line(&mut input).unwrap();
+        } => {
+            println!("收到用户停止信号...");
+        }
+        _ = &mut rx => {
+            println!("收到Ctrl+C信号...");
+        }
+    }
 
-    // 停止透明代理系统
+    // 停止服务器
     println!("\n🛑 停止透明代理系统...");
-    transparent_proxy.stop().await?;
+    server_handle.abort();
     println!("✅ 透明代理系统已停止");
 
     Ok(())

@@ -62,6 +62,88 @@ pub fn check_privileges() -> Result<bool> {
     }
 }
 
+/// Request privilege escalation from the user using macOS Authorization Services
+/// Returns true if escalation was successful, false if denied/failed
+pub fn request_privilege_escalation() -> Result<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        println!("🔒 此程序需要管理员权限来修改系统网络规则");
+        
+        // Try to use osascript to show a system authentication dialog
+        use std::process::Command;
+        
+        let script = r#"
+        do shell script "sudo -v && echo 'Privileges verified'" with administrator privileges
+        "#;
+        
+        println!("🔑 请在弹出的对话框中输入您的密码...");
+        
+        let output = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()?;
+            
+        if output.status.success() {
+            // 确保 sudo 缓存真正建立 - 再次验证
+            let sudo_check = Command::new("sudo")
+                .arg("-n")  // 非交互模式
+                .arg("true") // 简单的 true 命令
+                .output()?;
+                
+            if sudo_check.status.success() {
+                println!("✅ 权限验证成功！程序将继续以当前用户身份运行");
+                println!("💡 需要管理员权限的操作将使用已验证的凭据");
+                Ok(true)
+            } else {
+                println!("⚠️  AppleScript 验证成功，但 sudo 缓存未建立，将重试...");
+                // 重新建立 sudo 缓存
+                let sudo_refresh = Command::new("sudo")
+                    .arg("-v")
+                    .status()?;
+                if sudo_refresh.success() {
+                    println!("✅ sudo 缓存已建立");
+                    Ok(true)
+                } else {
+                    println!("❌ 无法建立 sudo 缓存");
+                    Ok(false)
+                }
+            }
+        } else {
+            println!("❌ 权限验证失败或被取消");
+            Ok(false)
+        }
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("⚠️  此权限提升方式仅支持 macOS");
+        Ok(false)
+    }
+}
+
+/// Execute a command with administrator privileges using sudo (after initial AppleScript verification)
+pub fn execute_admin_command(command: &str, args: &[&str]) -> Result<std::process::Output> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        
+        // Use sudo with cached credentials (no password prompt after AppleScript verification)
+        let mut cmd = Command::new("sudo");
+        cmd.arg(command);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        
+        let output = cmd.output()?;
+        Ok(output)
+    }
+    
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(anyhow::anyhow!("Admin command execution not supported on this platform"))
+    }
+}
+
 /// Get the executable path for a given process ID
 pub fn get_process_executable_path(pid: u32) -> Result<String> {
     #[cfg(target_os = "macos")]

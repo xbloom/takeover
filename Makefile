@@ -54,3 +54,6 @@ config:
 	else \
 		echo "config.json already exists"; \
 	fi
+
+demo:
+	sudo cargo run --example test_proxy_manager
