@@ -11,6 +11,8 @@ use std::process::Command;
 use tracing::{info, warn, error, debug};
 use std::ffi::{CStr, CString};
 
+use crate::utils;
+
 /// 默认的透明代理专用用户名
 pub const DEFAULT_PROXY_USER: &str = "_takeover_proxy";
 
@@ -46,7 +48,20 @@ impl UserManager {
 
     /// 检查是否具有管理员权限
     pub fn check_admin_privileges() -> bool {
-        unsafe { libc::geteuid() == 0 }
+        use std::env;
+        
+        // Check if effective user ID is 0 (root)
+        let is_root = unsafe { libc::geteuid() == 0 };
+        
+        // Check if running under sudo (via environment variables)
+        let has_sudo_uid = env::var("SUDO_UID").is_ok();
+        let has_sudo_gid = env::var("SUDO_GID").is_ok();
+        let is_under_sudo = has_sudo_uid && has_sudo_gid;
+        
+        // Check if already escalated via our escalation method
+        let escalated_marker = env::var("TAKEOVER_ESCALATED").is_ok();
+        
+        is_root || is_under_sudo || escalated_marker
     }
 
     /// 使用AppleScript临时申请管理员权限执行命令
@@ -141,9 +156,6 @@ impl UserManager {
 
     /// 确保代理用户存在，如果不存在则创建
     pub async fn ensure_proxy_user(&self) -> Result<()> {
-        if !self.is_admin {
-            return Err(anyhow::anyhow!("需要管理员权限才能创建用户"));
-        }
 
         if self.user_exists(&self.proxy_user) {
             info!("✅ 代理用户 '{}' 已存在", self.proxy_user);
@@ -153,14 +165,12 @@ impl UserManager {
         info!("🔨 创建代理用户: {}", self.proxy_user);
         
         // 在macOS上创建用户，设置为系统用户，不能登录
-        let mut cmd = Command::new("dscl");
-        cmd.args(&[
+        let output = utils::execute_admin_command("dscl", &[
             ".",
             "create",
             &format!("/Users/{}", self.proxy_user),
-        ]);
+        ])?;
 
-        let output = cmd.output()?;
         if !output.status.success() {
             return Err(anyhow::anyhow!(
                 "创建用户失败: {}", 
@@ -170,55 +180,44 @@ impl UserManager {
 
         // 设置用户ID (使用系统用户范围)
         let uid = self.find_available_system_uid().await?;
-        let mut cmd = Command::new("dscl");
-        cmd.args(&[
+        let output = utils::execute_admin_command("dscl", &[
             ".",
             "create",
             &format!("/Users/{}", self.proxy_user),
             "UniqueID",
             &uid.to_string(),
-        ]);
+        ])?;
 
-        let output = cmd.output()?;
         if !output.status.success() {
             warn!("设置用户ID失败，但用户可能已创建");
         }
 
         // 设置用户组ID
-        let mut cmd = Command::new("dscl");
-        cmd.args(&[
+        let _ = utils::execute_admin_command("dscl", &[
             ".",
             "create",
             &format!("/Users/{}", self.proxy_user),
             "PrimaryGroupID",
             "99", // nobody组
-        ]);
-
-        let _ = cmd.output(); // 忽略错误
+        ]); // 忽略错误
 
         // 设置用户shell为不可登录
-        let mut cmd = Command::new("dscl");
-        cmd.args(&[
+        let _ = utils::execute_admin_command("dscl", &[
             ".",
             "create",
             &format!("/Users/{}", self.proxy_user),
             "UserShell",
             "/usr/bin/false",
-        ]);
-
-        let _ = cmd.output(); // 忽略错误
+        ]); // 忽略错误
 
         // 设置实际名称
-        let mut cmd = Command::new("dscl");
-        cmd.args(&[
+        let _ = utils::execute_admin_command("dscl", &[
             ".",
             "create",
             &format!("/Users/{}", self.proxy_user),
             "RealName",
             "Takeover Transparent Proxy User",
-        ]);
-
-        let _ = cmd.output(); // 忽略错误
+        ]); // 忽略错误
 
         // 验证用户是否创建成功
         if self.user_exists(&self.proxy_user) {
@@ -233,9 +232,13 @@ impl UserManager {
     /// 查找可用的系统用户ID (200-399范围)
     async fn find_available_system_uid(&self) -> Result<u32> {
         for uid in 200..400 {
-            let output = Command::new("dscl")
-                .args(&[".", "search", "/Users", "UniqueID", &uid.to_string()])
-                .output()?;
+            let output = utils::execute_admin_command("dscl", &[
+                ".", 
+                "search", 
+                "/Users", 
+                "UniqueID", 
+                &uid.to_string()
+            ])?;
             
             // 如果没有找到使用此UID的用户，则可以使用
             if output.stdout.is_empty() {
@@ -259,14 +262,12 @@ impl UserManager {
 
         info!("🗑️  删除代理用户: {}", self.proxy_user);
         
-        let mut cmd = Command::new("dscl");
-        cmd.args(&[
+        let output = utils::execute_admin_command("dscl", &[
             ".",
             "delete",
             &format!("/Users/{}", self.proxy_user),
-        ]);
+        ])?;
 
-        let output = cmd.output()?;
         if !output.status.success() {
             return Err(anyhow::anyhow!(
                 "删除用户失败: {}", 
@@ -286,6 +287,35 @@ impl UserManager {
     /// 检查当前是否有管理员权限
     pub fn is_admin(&self) -> bool {
         Self::check_admin_privileges()
+    }
+
+    /// 检查是否有用户切换所需的 root 权限
+    pub fn has_user_switch_privileges(&self) -> bool {
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// 验证所有必要的权限并提供解决建议
+    pub fn validate_privileges(&self) -> Result<()> {
+        if !self.is_admin() {
+            return Err(anyhow::anyhow!(
+                "❌ 缺少管理员权限。某些操作（如修改防火墙规则）将失败。\n\
+                 建议：请以管理员权限运行程序。"
+            ));
+        }
+
+        if !self.has_user_switch_privileges() {
+            return Err(anyhow::anyhow!(
+                "❌ 缺少用户切换权限（需要 root 权限）。透明代理的循环避免功能将无法工作。\n\
+                 解决方案：\n\
+                 1. 使用 sudo 运行程序：sudo ./your_program\n\
+                 2. 或者在启动脚本中请求权限提升\n\
+                 \n\
+                 注意：用户切换是防止代理循环的重要安全机制。"
+            ));
+        }
+
+        info!("✅ 所有权限检查通过");
+        Ok(())
     }
 
     /// 使用管理员权限执行命令
@@ -314,6 +344,15 @@ impl UserManager {
     /// 主要用于启动时切换，避免每个连接都临时切换造成的并发问题。
     pub fn switch_to_proxy_user_permanently(&self) -> Result<()> {
         let current_euid = unsafe { libc::geteuid() };
+        
+        // 检查是否有 root 权限（EUID = 0）
+        if current_euid != 0 {
+            return Err(anyhow::anyhow!(
+                "需要 root 权限才能永久切换用户身份。请以管理员权限运行程序：\n\
+                 sudo ./your_program\n\
+                 或者确保程序在启动时已获得必要的权限提升。"
+            ));
+        }
         
         if let Some(target_uid) = Self::get_uid_by_name(&self.proxy_user) {
             // 检查是否已经是目标用户
@@ -352,6 +391,15 @@ impl UserSwitcher {
     /// 切换到指定用户身份
     pub fn switch_to_user(username: &str) -> Result<Self> {
         let original_euid = unsafe { libc::geteuid() };
+        
+        // 检查是否有 root 权限（EUID = 0）
+        if original_euid != 0 {
+            return Err(anyhow::anyhow!(
+                "需要 root 权限才能切换用户身份。请以管理员权限运行程序：\n\
+                 sudo ./your_program\n\
+                 或者确保程序在启动时已获得必要的权限提升。"
+            ));
+        }
         
         if let Some(target_uid) = UserManager::get_uid_by_name(username) {
             // 检查是否已经是目标用户 - 避免不必要的切换

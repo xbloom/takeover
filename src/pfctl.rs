@@ -80,9 +80,29 @@ impl Pfctl {
         debug!("Writing rules to anchor file: {:?}", self.anchor_file_path);
         debug!("Rules content:\n{}", content);
         
-        tokio::fs::write(&self.anchor_file_path, content).await?;
+        // 使用 sudo 权限写入文件到 /etc/pf.anchors/
+        let temp_file = format!("/tmp/pf_anchor_{}", self.anchor_name);
         
-        debug!("Successfully wrote rules to anchor file");
+        // 先写入临时文件
+        tokio::fs::write(&temp_file, content).await?;
+        
+        // 使用 sudo cp 将临时文件复制到目标位置
+        let output = utils::execute_admin_command("cp", &[&temp_file, &self.anchor_file_path.to_string_lossy()])?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // 清理临时文件
+            let _ = tokio::fs::remove_file(&temp_file).await;
+            return Err(anyhow::anyhow!("Failed to write anchor file with sudo: {}", stderr));
+        }
+        
+        // 设置正确的文件权限
+        let _output = utils::execute_admin_command("chmod", &["644", &self.anchor_file_path.to_string_lossy()])?;
+        
+        // 清理临时文件
+        let _ = tokio::fs::remove_file(&temp_file).await;
+        
+        debug!("Successfully wrote rules to anchor file with sudo");
         Ok(())
     }
 
@@ -195,12 +215,12 @@ impl Pfctl {
         
         let pf_conf_path = "/etc/pf.conf";
         
-        // 读取当前配置
-        let current_conf = match tokio::fs::read_to_string(pf_conf_path).await {
+        // 使用 sudo 读取当前配置
+        let current_conf = match self.read_file_with_sudo(pf_conf_path).await {
             Ok(content) => content,
             Err(e) => {
-                error!("Cannot read /etc/pf.conf: {}", e);
-                return Err(anyhow::anyhow!("Cannot read /etc/pf.conf: {}", e));
+                error!("Cannot read /etc/pf.conf with sudo: {}", e);
+                return Err(anyhow::anyhow!("Cannot read /etc/pf.conf with sudo: {}", e));
             }
         };
 
@@ -227,8 +247,8 @@ impl Pfctl {
         // 构建新配置，将规则按正确顺序插入
         let new_conf = self.insert_anchor_rules_in_order(&current_conf, &comment, &rdr_anchor, &filter_anchor, &load_directive);
 
-        // 写入新配置
-        tokio::fs::write(pf_conf_path, &new_conf).await?;
+        // 使用 sudo 写入新配置
+        self.write_file_with_sudo(pf_conf_path, &new_conf).await?;
         
         debug!("Successfully added anchor '{}' to /etc/pf.conf", self.anchor_name);
         Ok(())
@@ -240,11 +260,11 @@ impl Pfctl {
         
         let pf_conf_path = "/etc/pf.conf";
         
-        // 读取当前配置
-        let current_conf = match tokio::fs::read_to_string(pf_conf_path).await {
+        // 使用 sudo 读取当前配置
+        let current_conf = match self.read_file_with_sudo(pf_conf_path).await {
             Ok(content) => content,
             Err(e) => {
-                warn!("Cannot read /etc/pf.conf: {}", e);
+                warn!("Cannot read /etc/pf.conf with sudo: {}", e);
                 return Ok(()); // 不是致命错误
             }
         };
@@ -254,7 +274,7 @@ impl Pfctl {
         
         // 只有在确实有变化时才写入
         if new_conf != current_conf {
-            tokio::fs::write(pf_conf_path, &new_conf).await?;
+            self.write_file_with_sudo(pf_conf_path, &new_conf).await?;
             debug!("Successfully removed anchor '{}' from /etc/pf.conf", self.anchor_name);
         } else {
             debug!("Anchor '{}' not found in /etc/pf.conf", self.anchor_name);
@@ -282,7 +302,7 @@ impl Pfctl {
 
     /// 检查 pf 是否启用
     pub async fn is_enabled(&self) -> Result<bool> {
-        let output = self.execute(&["-s", "info"]).await?;
+        let output = self.execute_admin(&["-s", "info"]).await?;
         
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
@@ -324,6 +344,52 @@ impl Pfctl {
     }
 
     // === 辅助方法 ===
+
+    /// 使用 sudo 权限读取文件
+    async fn read_file_with_sudo(&self, file_path: &str) -> Result<String> {
+        debug!("Reading file with sudo: {}", file_path);
+        
+        let output = utils::execute_admin_command("cat", &[file_path])?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to read file {} with sudo: {}", file_path, stderr));
+        }
+        
+        let content = String::from_utf8_lossy(&output.stdout).to_string();
+        debug!("Successfully read file with sudo: {} ({} bytes)", file_path, content.len());
+        Ok(content)
+    }
+
+    /// 使用 sudo 权限写入文件
+    async fn write_file_with_sudo(&self, file_path: &str, content: &str) -> Result<()> {
+        debug!("Writing file with sudo: {}", file_path);
+        
+        // 创建临时文件
+        let temp_file = format!("/tmp/pf_temp_{}", self.anchor_name);
+        
+        // 先写入临时文件
+        tokio::fs::write(&temp_file, content).await?;
+        
+        // 使用 sudo cp 将临时文件复制到目标位置
+        let output = utils::execute_admin_command("cp", &[&temp_file, file_path])?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // 清理临时文件
+            let _ = tokio::fs::remove_file(&temp_file).await;
+            return Err(anyhow::anyhow!("Failed to write file {} with sudo: {}", file_path, stderr));
+        }
+        
+        // 设置正确的文件权限
+        let _output = utils::execute_admin_command("chmod", &["644", file_path])?;
+        
+        // 清理临时文件
+        let _ = tokio::fs::remove_file(&temp_file).await;
+        
+        debug!("Successfully wrote file with sudo: {} ({} bytes)", file_path, content.len());
+        Ok(())
+    }
 
     /// 按正确顺序插入锚点规则到配置文件中
     fn insert_anchor_rules_in_order(&self, conf: &str, comment: &str, rdr_anchor: &str, filter_anchor: &str, load_directive: &str) -> String {
