@@ -60,9 +60,9 @@ impl TransparentServer {
         &mut self.user_manager
     }
 
-    /// 启动透明代理服务器
-    pub async fn start(&mut self, intercepted_ports: &[u16]) -> Result<()> {
-        info!("🚀 Starting transparent proxy server");
+    /// 初始化透明代理服务器（不进入运行循环）
+    pub async fn initialize(&mut self, intercepted_ports: &[u16]) -> Result<()> {
+        info!("🚀 Initializing transparent proxy server");
         
         // 确保代理用户存在
         self.user_manager.ensure_proxy_user().await?;
@@ -97,13 +97,24 @@ impl TransparentServer {
         info!("🛡️ Using proxy user for bypass: {}", proxy_user);
         self.proxy_manager.start(local_port, intercepted_ports, Some(proxy_user)).await?;
         
-        // 3. 启动连接处理循环
+        // 3. 保存监听器和端口信息
         self.local_listener = Some(listener);
         self.local_port = Some(local_port);
         
-        info!("✅ Transparent proxy server started on port: {}", local_port);
+        info!("✅ Transparent proxy server initialized on port: {}", local_port);
         info!("🌐 Intercepting traffic on ports: {:?}", intercepted_ports);
         
+        Ok(())
+    }
+
+    /// 启动透明代理服务器（包含初始化和运行）
+    pub async fn start(&mut self, intercepted_ports: &[u16]) -> Result<()> {
+        self.initialize(intercepted_ports).await?;
+        self.run_server().await
+    }
+
+    /// 运行服务器（必须先调用 initialize）
+    pub async fn serve(&mut self) -> Result<()> {
         self.run_server().await
     }
 

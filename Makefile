@@ -57,3 +57,6 @@ config:
 
 demo:
 	sudo cargo run --example test_proxy_manager
+
+server:
+	sudo cargo run --example test_proxy_manager
