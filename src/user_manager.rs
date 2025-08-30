@@ -392,15 +392,6 @@ impl UserSwitcher {
     pub fn switch_to_user(username: &str) -> Result<Self> {
         let original_euid = unsafe { libc::geteuid() };
         
-        // 检查是否有 root 权限（EUID = 0）
-        if original_euid != 0 {
-            return Err(anyhow::anyhow!(
-                "需要 root 权限才能切换用户身份。请以管理员权限运行程序：\n\
-                 sudo ./your_program\n\
-                 或者确保程序在启动时已获得必要的权限提升。"
-            ));
-        }
-        
         if let Some(target_uid) = UserManager::get_uid_by_name(username) {
             // 检查是否已经是目标用户 - 避免不必要的切换
             if original_euid == target_uid {

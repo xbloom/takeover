@@ -7,6 +7,8 @@ use crate::user_manager::UserManager;
 use anyhow::Result;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use std::sync::Arc;
 
 use tracing::{info, warn, error, debug};
 
@@ -24,10 +26,17 @@ pub struct TransparentServer {
     user_manager: UserManager,
     local_listener: Option<TcpListener>,
     local_port: Option<u16>,
+    /// 连接数限制信号量
+    connection_semaphore: Arc<Semaphore>,
+    /// 最大并发连接数
+    max_connections: usize,
+    /// 是否应该停止服务
+    should_stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TransparentServer {
     pub fn new(proxy_config: ProxyConfig, routing_engine: RoutingEngine) -> Self {
+        const DEFAULT_MAX_CONNECTIONS: usize = 1000;
         Self {
             proxy_config,
             routing_engine,
@@ -35,11 +44,15 @@ impl TransparentServer {
             user_manager: UserManager::new(),
             local_listener: None,
             local_port: None,
+            connection_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            should_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
     /// 使用自定义用户管理器创建透明代理服务器
     pub fn with_user_manager(proxy_config: ProxyConfig, routing_engine: RoutingEngine, user_manager: UserManager) -> Self {
+        const DEFAULT_MAX_CONNECTIONS: usize = 1000;
         Self {
             proxy_config,
             routing_engine,
@@ -47,6 +60,9 @@ impl TransparentServer {
             user_manager,
             local_listener: None,
             local_port: None,
+            connection_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+            should_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -122,6 +138,9 @@ impl TransparentServer {
     pub async fn stop(&mut self) -> Result<()> {
         info!("🛑 Stopping transparent proxy server");
         
+        // 设置停止标志
+        self.should_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        
         // 清理pfctl规则（由 TransparentProxyManager 统一管理）
         self.proxy_manager.stop().await?;
         
@@ -139,30 +158,87 @@ impl TransparentServer {
             .ok_or_else(|| anyhow::anyhow!("Server not started"))?;
 
         info!("Transparent server listening, ready to handle connections...");
+        info!("📊 Max concurrent connections: {}", self.max_connections);
+
+        let mut consecutive_errors = 0u32;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+        const ERROR_BACKOFF_MS: u64 = 100;
 
         loop {
+            // 检查是否应该停止
+            if self.should_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                info!("🛑 Received stop signal, exiting server loop");
+                break;
+            }
+
             match listener.accept().await {
                 Ok((client_stream, client_addr)) => {
+                    consecutive_errors = 0; // 重置错误计数
                     debug!("New transparent connection from: {}", client_addr);
                     
-                    let proxy_config = self.proxy_config.clone();
-                    let routing_engine = self.routing_engine.clone();
-                    let user_manager = self.user_manager.clone();
-                    
-                    // 为每个连接启动处理任务
-                    tokio::spawn(Self::handle_connection(
-                        client_stream,
-                        client_addr,
-                        proxy_config,
-                        routing_engine,
-                        user_manager,
-                    ));
+                    // 检查连接数限制
+                    match self.connection_semaphore.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            let proxy_config = self.proxy_config.clone();
+                            let routing_engine = self.routing_engine.clone();
+                            let user_manager = self.user_manager.clone();
+                            
+                            // 为每个连接启动处理任务，传递许可证
+                            tokio::spawn(async move {
+                                let _permit = permit; // 任务结束时自动释放许可
+                                if let Err(e) = Self::handle_connection(
+                                    client_stream,
+                                    client_addr,
+                                    proxy_config,
+                                    routing_engine,
+                                    user_manager,
+                                ).await {
+                                    debug!("Connection {} handling error: {}", client_addr, e);
+                                }
+                            });
+                        }
+                        Err(_) => {
+                            warn!("⚠️ Maximum connections ({}) reached, rejecting connection from {}", 
+                                  self.max_connections, client_addr);
+                            // 直接关闭连接
+                            drop(client_stream);
+                        }
+                    }
                 }
                 Err(e) => {
-                    error!("Failed to accept connection: {}", e);
-                    break;
+                    consecutive_errors += 1;
+                    
+                    // 区分错误类型
+                    let is_temporary = matches!(e.kind(), 
+                        std::io::ErrorKind::WouldBlock |
+                        std::io::ErrorKind::Interrupted |
+                        std::io::ErrorKind::TimedOut
+                    );
+                    
+                    if is_temporary || consecutive_errors < MAX_CONSECUTIVE_ERRORS {
+                        warn!("⚠️ Temporary accept error #{}: {} (retrying)", consecutive_errors, e);
+                        
+                        // 指数退避
+                        let backoff_ms = ERROR_BACKOFF_MS * (1u64 << (consecutive_errors.min(5) as u64));
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    } else {
+                        error!("❌ Too many consecutive accept errors ({}), stopping server: {}", consecutive_errors, e);
+                        break;
+                    }
                 }
             }
+        }
+
+        info!("📊 Server loop ended. Waiting for active connections to finish...");
+        
+        // 等待所有连接完成
+        let timeout = Duration::from_secs(30);
+        match tokio::time::timeout(timeout, async {
+            // 获取所有许可证，意味着所有连接都已结束
+            let _all_permits = self.connection_semaphore.clone().acquire_many_owned(self.max_connections as u32).await;
+        }).await {
+            Ok(_) => info!("✅ All connections completed gracefully"),
+            Err(_) => warn!("⚠️ Timeout waiting for connections to finish"),
         }
 
         Ok(())
@@ -193,6 +269,7 @@ impl TransparentServer {
         let process_path = None; // TODO: 可以通过系统调用获取进程路径
         
         // 3. 路由决策 - 这是核心！
+        // info!("inferring full url: {:?}", request_url);
         let decision = routing_engine.should_proxy(
             &target_host, 
             target_port, 
@@ -628,11 +705,14 @@ impl TransparentServer {
                     }
                 }
                 
-                // 没有端口，根据方法推断默认端口
-                let default_port = if url_or_path.starts_with("https://") || 
-                                     request_str.contains("443") {
+                
+                // 没有端口，根据协议推断默认端口
+                // 注意：透明代理应该从原始连接获取端口，而不是从HTTP内容推断
+                let default_port = if url_or_path.starts_with("https://") {
                     DEFAULT_HTTPS_PORT
                 } else {
+                    // 对于普通HTTP请求，默认使用80端口
+                    // TODO: 理想情况下应该从SO_ORIGINAL_DST或pfctl获取原始目标端口
                     DEFAULT_HTTP_PORT
                 };
                 
@@ -654,6 +734,27 @@ impl TransparentServer {
 
     pub fn get_local_port(&self) -> Option<u16> {
         self.local_port
+    }
+
+    /// 设置最大并发连接数
+    pub fn set_max_connections(&mut self, max_connections: usize) {
+        self.max_connections = max_connections;
+        self.connection_semaphore = Arc::new(Semaphore::new(max_connections));
+        info!("📊 Updated max concurrent connections to: {}", max_connections);
+    }
+
+    /// 获取当前活跃连接数
+    pub fn get_active_connections(&self) -> usize {
+        self.max_connections - self.connection_semaphore.available_permits()
+    }
+
+    /// 获取服务器状态
+    pub fn get_server_stats(&self) -> (usize, usize, bool) {
+        (
+            self.get_active_connections(),
+            self.max_connections,
+            self.should_stop.load(std::sync::atomic::Ordering::Relaxed)
+        )
     }
 }
 
