@@ -8,7 +8,7 @@ pub mod pfctl;
 pub mod transparent_proxy_manager;
 pub mod routing_engine;
 pub mod transparent_server;
-pub mod transparent_proxy;
+pub mod poc_trans_proxy;
 
 pub mod user_manager;
 
@@ -22,5 +22,4 @@ pub use pfctl::Pfctl;
 pub use transparent_proxy_manager::{TransparentProxyManager};
 pub use routing_engine::{RoutingEngine, RoutingRules, RoutingDecision};
 pub use transparent_server::TransparentServer;
-pub use transparent_proxy::{TransparentProxy, ProxyMode};
 pub use user_manager::{UserManager, UserSwitcher};

@@ -5,7 +5,7 @@ use tokio::signal;
 use tracing::{info, error};
 
 // 导入我们的模块
-use takeover::{ProxyConfig, ProxyType, TransparentProxy, ProxyMode};
+use takeover::{ProxyConfig, ProxyType, poc_trans_proxy::PocTransparentProxy, poc_trans_proxy::ProxyMode};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     }
 
     // 创建Smart Monitoring模式的透明代理
-    let mut proxy = TransparentProxy::with_mode(
+    let mut proxy = PocTransparentProxy::with_mode(
         proxy_config,
         ProxyMode::SmartMonitoring { 
             target_patterns: target_patterns.clone()

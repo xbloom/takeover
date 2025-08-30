@@ -45,7 +45,7 @@ impl Default for ProxyMode {
 
 /// macOS透明代理系统 - 使用pfctl实现真正透明的网络拦截
 #[derive(Debug)]
-pub struct TransparentProxy {
+pub struct PocTransparentProxy {
     /// 代理配置
     proxy_config: ProxyConfig,
     /// 代理模式
@@ -75,7 +75,7 @@ struct PfctlRuleManager {
 #[derive(Debug)]
 struct ReadinessChecker;
 
-impl TransparentProxy {
+impl PocTransparentProxy {
     /// 创建新的透明代理实例
     pub fn new(proxy_config: ProxyConfig) -> Self {
         Self::with_mode(proxy_config, ProxyMode::default())
@@ -364,7 +364,7 @@ impl TransparentProxy {
     }
 }
 
-impl Drop for TransparentProxy {
+impl Drop for PocTransparentProxy {
     fn drop(&mut self) {
         warn!("TransparentProxy dropped, performing emergency cleanup");
         
@@ -919,7 +919,7 @@ mod tests {
             auth: None,
         };
 
-        let proxy = TransparentProxy::new(proxy_config);
+        let proxy = PocTransparentProxy::new(proxy_config);
         assert!(proxy.local_proxy_server.is_none());
         assert!(proxy.get_local_port().is_none());
     }

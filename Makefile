@@ -20,7 +20,10 @@ debug:
 	cargo build
 
 clean:
-	cargo clean
+	sudo pfctl -a takeover_transparent -F all
+	sudo pkill -9 takeover
+	sudo pkill -9 simple_proxy_server
+	sudo pkill -9 transparent_proxy_demo
 
 install: build
 	cargo install --path .
@@ -59,4 +62,10 @@ demo:
 	sudo cargo run --example test_proxy_manager
 
 server:
-	sudo cargo run --example test_proxy_manager
+	sudo cargo run --example simple_proxy_server
+
+rel:
+	cargo build --release --example simple_proxy_server
+	sudo chown root target/release/examples/simple_proxy_server
+	sudo chmod u+s target/release/examples/simple_proxy_server 
+	./target/release/examples/simple_proxy_server
