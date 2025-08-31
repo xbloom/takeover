@@ -331,7 +331,7 @@ mod tests {
         let filter_rules = manager.generate_filter_rules();
         
         assert_eq!(filter_rules.len(), 2);
-        assert!(filter_rules.iter().all(|r| r.contains("pass out route-to (lo0 127.0.0.1)")));
+        assert!(filter_rules.iter().all(|r| r.contains("pass out quick route-to (lo0 127.0.0.1)")));
         assert!(filter_rules.iter().all(|r| r.contains("keep state")));
     }
 

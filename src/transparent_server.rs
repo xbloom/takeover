@@ -1,9 +1,12 @@
 use crate::config::ProxyConfig;
 use crate::socks5::{Socks5Client, DataForwarder};
 // TrafficStats 通过方法返回值使用，不需要直接导入
-use crate::routing_engine::{RoutingEngine, RoutingDecision};
+use crate::routing_engine::{RoutingEngine, RoutingDecision, TlsInterceptionMode};
 use crate::transparent_proxy_manager::TransparentProxyManager;
 use crate::user_manager::UserManager;
+use crate::protocol_handler::TransparentConnectionParser;
+use crate::tls_interception::{TlsInterceptionManager, RuntimeTlsConfig, TlsStream};
+use crate::protocol_handler::{ProtocolInfo, ProtocolType};
 use anyhow::Result;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -12,11 +15,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn, error, debug};
 
-const PEEK_TIMEOUT_MS: u64 = 500;
-const PEEK_BUFFER_SIZE: usize = 4096;
 const PROXY_BUFFER_SIZE: usize = 8192;
-const DEFAULT_HTTP_PORT: u16 = 80;
-const DEFAULT_HTTPS_PORT: u16 = 443;
 
 /// 透明代理服务器 - 核心的连接处理器
 pub struct TransparentServer {
@@ -24,6 +23,10 @@ pub struct TransparentServer {
     routing_engine: RoutingEngine,
     proxy_manager: TransparentProxyManager,
     user_manager: UserManager,
+    #[allow(dead_code)]
+    protocol_parser: TransparentConnectionParser,
+    /// TLS拦截管理器
+    tls_manager: Option<TlsInterceptionManager>,
     local_listener: Option<TcpListener>,
     local_port: Option<u16>,
     /// 连接数限制信号量
@@ -42,6 +45,8 @@ impl TransparentServer {
             routing_engine,
             proxy_manager: TransparentProxyManager::new(),
             user_manager: UserManager::new(),
+            protocol_parser: TransparentConnectionParser::new(),
+            tls_manager: None,
             local_listener: None,
             local_port: None,
             connection_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
@@ -58,6 +63,8 @@ impl TransparentServer {
             routing_engine,
             proxy_manager: TransparentProxyManager::new(),
             user_manager,
+            protocol_parser: TransparentConnectionParser::new(),
+            tls_manager: None,
             local_listener: None,
             local_port: None,
             connection_semaphore: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
@@ -76,12 +83,77 @@ impl TransparentServer {
         &mut self.user_manager
     }
 
+    /// 启用TLS拦截功能
+    /// 
+    /// # 参数
+    /// - `cert_store_path`: 可选的证书存储路径。如果为 None，则使用默认路径 `~/.config/takeover/`
+    pub fn enable_tls_interception(&mut self, cert_store_path: Option<&str>) -> Result<()> {
+        let tls_manager = match cert_store_path {
+            Some(path) => {
+                info!("✅ TLS拦截功能已启用，证书存储路径: {}", path);
+                TlsInterceptionManager::new_real(path)
+            },
+            None => {
+                info!("✅ TLS拦截功能已启用，使用默认证书存储路径");
+                TlsInterceptionManager::new_real_with_default_path()?
+            }
+        };
+        
+        // 设置默认运行时配置
+        let mut runtime_config = RuntimeTlsConfig::default();
+        runtime_config.enabled = true;
+        runtime_config.mode = TlsInterceptionMode::Selective;
+        
+        let mut tls_manager = tls_manager;
+        tls_manager.set_runtime_config(runtime_config);
+        self.tls_manager = Some(tls_manager);
+        
+        Ok(())
+    }
+
+    /// 禁用TLS拦截功能
+    pub fn disable_tls_interception(&mut self) {
+        self.tls_manager = None;
+        info!("❌ TLS拦截功能已禁用");
+    }
+
+    /// 配置TLS拦截设置
+    pub fn configure_tls_interception(&mut self, config: RuntimeTlsConfig) -> Result<()> {
+        if let Some(ref mut tls_manager) = self.tls_manager {
+            tls_manager.set_runtime_config(config);
+            info!("✅ TLS拦截配置已更新");
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!("TLS拦截功能未启用，请先调用 enable_tls_interception()"))
+        }
+    }
+
+    /// 获取TLS拦截管理器的引用
+    pub fn tls_manager(&self) -> Option<&TlsInterceptionManager> {
+        self.tls_manager.as_ref()
+    }
+
+    /// 获取TLS拦截管理器的可变引用
+    pub fn tls_manager_mut(&mut self) -> Option<&mut TlsInterceptionManager> {
+        self.tls_manager.as_mut()
+    }
+
     /// 初始化透明代理服务器（不进入运行循环）
     pub async fn initialize(&mut self, intercepted_ports: &[u16]) -> Result<()> {
         info!("🚀 Initializing transparent proxy server");
         
         // 确保代理用户存在
         self.user_manager.ensure_proxy_user().await?;
+
+        // 如果启用了TLS拦截，初始化TLS环境
+        if let Some(ref mut tls_manager) = self.tls_manager {
+            info!("🔐 初始化TLS拦截环境...");
+            if let Err(e) = tls_manager.initialize().await {
+                warn!("TLS拦截初始化失败，但继续启动透明代理: {}", e);
+            } else {
+                info!("✅ TLS拦截环境初始化完成");
+            }
+        }
         
         // 显示当前用户信息和代理用户设置
         if let Some(current_user) = UserManager::get_current_user() {
@@ -182,6 +254,8 @@ impl TransparentServer {
                             let proxy_config = self.proxy_config.clone();
                             let routing_engine = self.routing_engine.clone();
                             let user_manager = self.user_manager.clone();
+                            let protocol_parser = TransparentConnectionParser::new();
+                            let tls_manager = self.tls_manager.clone();
                             
                             // 为每个连接启动处理任务，传递许可证
                             tokio::spawn(async move {
@@ -192,6 +266,8 @@ impl TransparentServer {
                                     proxy_config,
                                     routing_engine,
                                     user_manager,
+                                    protocol_parser,
+                                    tls_manager,
                                 ).await {
                                     debug!("Connection {} handling error: {}", client_addr, e);
                                 }
@@ -251,49 +327,71 @@ impl TransparentServer {
         proxy_config: ProxyConfig,
         routing_engine: RoutingEngine,
         user_manager: UserManager,
+        protocol_parser: TransparentConnectionParser,
+        tls_manager: Option<TlsInterceptionManager>,
     ) -> Result<()> {
         debug!("Handling transparent connection from: {}", client_addr);
 
-        // 1. 解析目标地址
-        let (target_host, target_port) = Self::parse_target_from_stream(&client_stream).await?;
-        debug!("Parsed target: {}:{}", target_host, target_port);
+        // 1. 使用新的协议解析器解析连接信息
+        let protocol_info = protocol_parser.parse_from_stream(&client_stream).await?;
+        debug!("Parsed protocol info: {:?}", protocol_info);
+
+        let target_host = &protocol_info.target_host;
+        let target_port = protocol_info.target_port;
 
         // 🛡️ 防循环检查：避免拦截到SOCKS5代理的连接
-        if Self::is_loop_connection(&proxy_config, &target_host, target_port) {
+        if Self::is_loop_connection(&proxy_config, target_host, target_port) {
             debug!("🛡️ Detected potential loop connection to SOCKS5 proxy, using direct connection");
-            return Self::handle_direct_connection(client_stream, &target_host, target_port, None, &user_manager).await;
+            return Self::handle_direct_connection(client_stream, target_host, target_port, None, &user_manager).await;
         }
 
-        // 2. 提取完整URL（如果可能）
-        let request_url = Self::extract_full_url_from_stream(&client_stream).await.ok();
         let process_path = None; // TODO: 可以通过系统调用获取进程路径
         
-        // 3. 路由决策 - 这是核心！
-        // info!("inferring full url: {:?}", request_url);
+        // 2. 路由决策 - 这是核心！
         let decision = routing_engine.should_proxy(
-            &target_host, 
+            target_host, 
             target_port, 
-            request_url.as_deref(),
+            protocol_info.full_url.as_deref(),
             process_path,
             &client_addr
         );
         
         match decision {
-            RoutingDecision::Proxy { rewritten_url } => {
+            RoutingDecision::Proxy { rewritten_url, tls_interception } => {
                 if let Some(ref rewritten) = rewritten_url {
                     info!("🔀 Proxying {}:{} via SOCKS5 (URL rewritten to: {})", target_host, target_port, rewritten);
                 } else {
                     info!("🔀 Proxying {}:{} via SOCKS5", target_host, target_port);
                 }
-                Self::handle_proxy_connection(client_stream, proxy_config, &target_host, target_port, rewritten_url, &user_manager).await
+                
+                // 检查是否需要TLS拦截
+                if Self::should_intercept_tls(&protocol_info, &tls_interception, &tls_manager).await {
+                    info!("🔐 启用TLS拦截代理模式：{}:{}", target_host, target_port);
+                    Self::handle_tls_intercept_proxy_connection(
+                        client_stream, proxy_config, target_host, target_port, 
+                        rewritten_url, &user_manager, tls_manager.as_ref().unwrap()
+                    ).await
+                } else {
+                    Self::handle_proxy_connection(client_stream, proxy_config, target_host, target_port, rewritten_url, &user_manager).await
+                }
             }
-            RoutingDecision::Direct { rewritten_url } => {
+            RoutingDecision::Direct { rewritten_url, tls_interception } => {
                 if let Some(ref rewritten) = rewritten_url {
                     info!("🔗 Direct connection to {}:{} (URL rewritten to: {})", target_host, target_port, rewritten);
                 } else {
                     info!("🔗 Direct connection to {}:{}", target_host, target_port);
                 }
-                Self::handle_direct_connection(client_stream, &target_host, target_port, rewritten_url, &user_manager).await
+                
+                // 检查是否需要TLS拦截
+                if Self::should_intercept_tls(&protocol_info, &tls_interception, &tls_manager).await {
+                    info!("🔐 启用TLS拦截直连模式：{}:{}", target_host, target_port);
+                    Self::handle_tls_intercept_direct_connection(
+                        client_stream, target_host, target_port, 
+                        rewritten_url, &user_manager, tls_manager.as_ref().unwrap()
+                    ).await
+                } else {
+                    Self::handle_direct_connection(client_stream, target_host, target_port, rewritten_url, &user_manager).await
+                }
             }
         }
     }
@@ -399,111 +497,195 @@ impl TransparentServer {
         Ok(stream)
     }
 
-
-    /// 从透明连接中解析目标地址
-    async fn parse_target_from_stream(stream: &TcpStream) -> Result<(String, u16)> {
-        // 使用peek来读取第一部分数据，判断协议类型
-        let mut buffer = vec![0u8; PEEK_BUFFER_SIZE];
-        let n = match tokio::time::timeout(
-            Duration::from_millis(PEEK_TIMEOUT_MS),
-            stream.peek(&mut buffer)
-        ).await {
-            Ok(Ok(n)) if n > 0 => n,
-            _ => {
-                debug!("Failed to peek client data");
-                return Err(anyhow::anyhow!("Failed to read client data"));
-            }
+    /// 判断是否应该进行TLS拦截
+    async fn should_intercept_tls(
+        protocol_info: &ProtocolInfo,
+        tls_interception_mode: &TlsInterceptionMode,
+        tls_manager: &Option<TlsInterceptionManager>,
+    ) -> bool {
+        // 只有HTTPS连接才考虑TLS拦截
+        if !matches!(protocol_info.protocol_type, ProtocolType::Https) {
+            return false;
+        }
+        
+        // 没有TLS管理器则不拦截
+        let tls_manager = match tls_manager.as_ref() {
+            Some(manager) => manager,
+            None => return false,
         };
-
-        let request_data = &buffer[..n];
         
-        // 检查是否是TLS握手
-        if Self::is_tls_handshake(request_data) {
-            debug!("Detected TLS handshake - extracting SNI");
-            Self::parse_tls_sni(request_data)
-        } else {
-            // 假设是HTTP请求
-            Self::parse_http_target(request_data)
+        // 检查TLS管理器是否启用
+        if !tls_manager.is_enabled() {
+            return false;
         }
-    }
-
-    /// 从透明连接中提取完整URL
-    async fn extract_full_url_from_stream(stream: &TcpStream) -> Result<String> {
-        // 使用peek来读取数据，判断协议类型
-        let mut buffer = vec![0u8; PEEK_BUFFER_SIZE];
-        let n = match tokio::time::timeout(
-            Duration::from_millis(PEEK_TIMEOUT_MS),
-            stream.peek(&mut buffer)
-        ).await {
-            Ok(Ok(n)) if n > 0 => n,
-            _ => {
-                return Err(anyhow::anyhow!("Failed to read client data"));
-            }
-        };
-
-        let request_data = &buffer[..n];
         
-        // 检查是否是TLS握手
-        if Self::is_tls_handshake(request_data) {
-            // 从TLS SNI提取hostname并构造HTTPS URL
-            let (hostname, _port) = Self::parse_tls_sni(request_data)?;
-            Ok(format!("https://{}/", hostname))
-        } else {
-            // HTTP请求
-            Self::extract_url_from_http_request(request_data)
-        }
-    }
-
-    /// 从HTTP请求中提取完整URL
-    fn extract_url_from_http_request(request_data: &[u8]) -> Result<String> {
-        let request_str = String::from_utf8_lossy(request_data);
-        let lines: Vec<&str> = request_str.lines().collect();
-        
-        if lines.is_empty() {
-            return Err(anyhow::anyhow!("Empty HTTP request"));
-        }
-
-        // 解析第一行获取方法和路径
-        let first_line = lines[0];
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
-        
-        if parts.len() < 2 {
-            return Err(anyhow::anyhow!("Invalid HTTP request line"));
-        }
-
-        let method = parts[0];
-        let url_or_path = parts[1];
-
-        // 如果已经是完整URL，直接返回
-        if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
-            return Ok(url_or_path.to_string());
-        }
-
-        // CONNECT方法处理
-        if method == "CONNECT" {
-            return Ok(format!("https://{}", url_or_path));
-        }
-
-        // 从Host头构造完整URL
-        for line in &lines[1..] {
-            if line.to_lowercase().starts_with("host:") {
-                let host = line[5..].trim();
-                
-                // 判断是否为HTTPS
-                let scheme = if url_or_path.starts_with("/") && 
-                               (request_str.contains(":443") || 
-                                request_str.to_lowercase().contains("https")) {
-                    "https"
-                } else {
-                    "http"
-                };
-                
-                return Ok(format!("{}://{}{}", scheme, host, url_or_path));
+        // 根据路由决策的TLS拦截模式判断
+        match tls_interception_mode {
+            TlsInterceptionMode::None => false,
+            TlsInterceptionMode::Selective | TlsInterceptionMode::Full => {
+                // 使用TLS管理器的拦截决策
+                tls_manager.should_intercept(&protocol_info.target_host).await
             }
         }
-
-        Err(anyhow::anyhow!("Could not extract URL from HTTP request"))
     }
+
+    /// 使用TLS拦截的代理连接处理
+    async fn handle_tls_intercept_proxy_connection(
+        client_stream: TcpStream,
+        proxy_config: ProxyConfig,
+        target_host: &str,
+        target_port: u16,
+        _rewritten_url: Option<String>,
+        user_manager: &UserManager,
+        tls_manager: &TlsInterceptionManager,
+    ) -> Result<()> {
+        info!("🔐 处理TLS拦截代理连接: {}:{}", target_host, target_port);
+        
+        // 1. 获取证书管理器并生成证书
+        let cert_manager = tls_manager.cert_manager();
+        let cert = cert_manager.get_or_generate_cert(target_host).await?;
+        
+        // 2. 创建服务器TLS配置（用我们的证书）
+        let server_config = crate::tls_interception::create_server_tls_config(&cert)?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        
+        // 3. 与客户端建立TLS连接
+        let client_tls_stream = acceptor.accept(client_stream).await?;
+        debug!("✅ 与客户端建立TLS连接成功: {}", target_host);
+        
+        // 4. 连接到SOCKS5代理
+        let host = proxy_config.host().map_err(|e| anyhow::anyhow!("Invalid proxy host: {}", e))?;
+        let port = proxy_config.port().map_err(|e| anyhow::anyhow!("Invalid proxy port: {}", e))?;
+        
+        debug!("🔗 通过SOCKS5代理连接到目标服务器 {}:{} -> {}:{}", host, port, target_host, target_port);
+        
+        let mut proxy_stream = Self::create_bypass_connection(&host, port, user_manager).await
+            .map_err(|e| anyhow::anyhow!("Failed to connect to SOCKS5 proxy: {}", e))?;
+        
+        // 5. 进行SOCKS5握手
+        crate::socks5::Socks5Client::connect(&mut proxy_stream, &proxy_config, target_host, target_port).await?;
+        debug!("✅ SOCKS5握手完成，已连接到目标服务器");
+        
+        // 6. 与真实目标服务器建立TLS连接（通过代理）
+        let client_config = crate::tls_interception::create_client_tls_config()?;
+        let connector = tokio_rustls::TlsConnector::from(client_config);
+        let domain_name = rustls::pki_types::ServerName::try_from(target_host.to_string())?;
+        let server_tls_stream = connector.connect(domain_name, proxy_stream).await?;
+        debug!("✅ 与目标服务器建立TLS连接成功（通过代理）: {}:{}", target_host, target_port);
+        
+        // 7. 包装TLS流并双向转发数据
+        let mut client_wrapper = crate::tls_interception::RustlsTlsStreamWrapper::Server(client_tls_stream);
+        let mut server_wrapper = crate::tls_interception::RustlsTlsStreamWrapper::Client(server_tls_stream);
+        
+        info!("✅ TLS拦截代理连接建立成功，开始双向数据转发");
+        
+        // 8. 双向转发TLS数据
+        Self::forward_tls_data(&mut client_wrapper, &mut server_wrapper).await?;
+        
+        info!("TLS拦截代理连接完成: {}:{}", target_host, target_port);
+        Ok(())
+    }
+
+    /// 使用TLS拦截的直连处理
+    async fn handle_tls_intercept_direct_connection(
+        client_stream: TcpStream,
+        target_host: &str,
+        target_port: u16,
+        _rewritten_url: Option<String>,
+        _user_manager: &UserManager,
+        tls_manager: &TlsInterceptionManager,
+    ) -> Result<()> {
+        info!("🔐 处理TLS拦截直连: {}:{}", target_host, target_port);
+        
+        // 1. 执行TLS拦截，获取双向TLS流
+        let (mut client_tls_stream, mut server_tls_stream) = tls_manager
+            .intercept(client_stream, target_host, target_port)
+            .await?;
+        
+        info!("✅ TLS拦截建立成功，开始双向数据转发");
+        
+        // 2. 双向转发TLS数据
+        Self::forward_tls_data(client_tls_stream.as_mut(), server_tls_stream.as_mut()).await?;
+        
+        info!("TLS拦截直连完成: {}:{}", target_host, target_port);
+        Ok(())
+    }
+
+
+
+    /// TLS数据双向转发
+    async fn forward_tls_data(
+        client_stream: &mut dyn TlsStream,
+        server_stream: &mut dyn TlsStream,
+    ) -> Result<()> {
+        let mut client_buffer = vec![0u8; PROXY_BUFFER_SIZE];
+        let mut server_buffer = vec![0u8; PROXY_BUFFER_SIZE];
+        
+        let mut client_to_server_bytes = 0u64;
+        let mut server_to_client_bytes = 0u64;
+        
+        loop {
+            tokio::select! {
+                // 客户端到服务器的数据传输
+                result = client_stream.read(&mut client_buffer) => {
+                    match result {
+                        Ok(0) => {
+                            debug!("客户端连接关闭");
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = server_stream.write(&client_buffer[..n]).await {
+                                debug!("向服务器写入失败: {}", e);
+                                break;
+                            }
+                            if let Err(e) = server_stream.flush().await {
+                                debug!("服务器流刷新失败: {}", e);
+                                break;
+                            }
+                            client_to_server_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            debug!("从客户端读取失败: {}", e);
+                            break;
+                        }
+                    }
+                }
+                
+                // 服务器到客户端的数据传输
+                result = server_stream.read(&mut server_buffer) => {
+                    match result {
+                        Ok(0) => {
+                            debug!("服务器连接关闭");
+                            break;
+                        }
+                        Ok(n) => {
+                            if let Err(e) = client_stream.write(&server_buffer[..n]).await {
+                                debug!("向客户端写入失败: {}", e);
+                                break;
+                            }
+                            if let Err(e) = client_stream.flush().await {
+                                debug!("客户端流刷新失败: {}", e);
+                                break;
+                            }
+                            server_to_client_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            debug!("从服务器读取失败: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        
+        info!("TLS数据转发完成 - 客户端→服务器: {} bytes, 服务器→客户端: {} bytes", 
+              client_to_server_bytes, server_to_client_bytes);
+        
+        Ok(())
+    }
+
+
+
 
     /// 🛡️ 增强的循环连接检测（辅助IP别名方法）
     fn is_loop_connection(proxy_config: &ProxyConfig, target_host: &str, target_port: u16) -> bool {
@@ -531,206 +713,7 @@ impl TransparentServer {
         false
     }
 
-    /// 检查是否是TLS握手数据包
-    fn is_tls_handshake(data: &[u8]) -> bool {
-        // TLS握手包的特征：
-        // - 第一个字节是0x16 (TLS Handshake)
-        // - 第二第三字节是版本号 (0x03, 0x01-0x04)
-        // - 第五个字节是0x01 (Client Hello)
-        if data.len() < 6 {
-            return false;
-        }
-        
-        data[0] == 0x16 && // TLS Handshake
-        data[1] == 0x03 && // TLS Version Major
-        (data[2] >= 0x01 && data[2] <= 0x04) && // TLS Version Minor (1.0-1.3)
-        data[5] == 0x01 // Client Hello
-    }
 
-    /// 从TLS Client Hello中提取SNI（Server Name Indication）
-    fn parse_tls_sni(data: &[u8]) -> Result<(String, u16)> {
-        if data.len() < 43 {
-            return Err(anyhow::anyhow!("TLS packet too short"));
-        }
-
-        // 跳过TLS记录头（5字节）和握手消息头（4字节）
-        let mut offset = 9;
-        
-        // 跳过版本号（2字节）
-        offset += 2;
-        
-        // 跳过随机数（32字节）
-        offset += 32;
-        
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("Invalid TLS packet structure"));
-        }
-        
-        // 跳过Session ID
-        let session_id_len = data[offset] as usize;
-        offset += 1 + session_id_len;
-        
-        if offset + 2 >= data.len() {
-            return Err(anyhow::anyhow!("Invalid TLS packet - session ID"));
-        }
-        
-        // 跳过Cipher Suites
-        let cipher_suites_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2 + cipher_suites_len;
-        
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("Invalid TLS packet - cipher suites"));
-        }
-        
-        // 跳过Compression Methods
-        let compression_len = data[offset] as usize;
-        offset += 1 + compression_len;
-        
-        if offset + 2 >= data.len() {
-            return Err(anyhow::anyhow!("Invalid TLS packet - compression"));
-        }
-        
-        // 读取Extensions长度
-        let extensions_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2;
-        
-        let extensions_end = offset + extensions_len;
-        if extensions_end > data.len() {
-            return Err(anyhow::anyhow!("Invalid TLS packet - extensions length"));
-        }
-        
-        // 解析Extensions寻找SNI
-        while offset < extensions_end {
-            if offset + 4 > data.len() {
-                break;
-            }
-            
-            let ext_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            let ext_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
-            offset += 4;
-            
-            if ext_type == 0x0000 {
-                // SNI Extension
-                return Self::parse_sni_extension(&data[offset..offset + ext_len]);
-            }
-            
-            offset += ext_len;
-        }
-        
-        Err(anyhow::anyhow!("No SNI found in TLS handshake"))
-    }
-
-    /// 解析SNI扩展
-    fn parse_sni_extension(data: &[u8]) -> Result<(String, u16)> {
-        if data.len() < 5 {
-            return Err(anyhow::anyhow!("SNI extension too short"));
-        }
-        
-        // 跳过SNI列表长度（2字节）
-        let mut offset = 2;
-        
-        // 读取第一个SNI条目
-        if offset >= data.len() {
-            return Err(anyhow::anyhow!("Invalid SNI structure"));
-        }
-        
-        let name_type = data[offset];
-        offset += 1;
-        
-        if name_type != 0x00 {
-            // 只处理hostname类型
-            return Err(anyhow::anyhow!("Unsupported SNI name type"));
-        }
-        
-        if offset + 2 > data.len() {
-            return Err(anyhow::anyhow!("Invalid SNI name length"));
-        }
-        
-        let name_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2;
-        
-        if offset + name_len > data.len() {
-            return Err(anyhow::anyhow!("Invalid SNI name"));
-        }
-        
-        let hostname = String::from_utf8_lossy(&data[offset..offset + name_len]).to_string();
-        
-        // 对于HTTPS，默认使用443端口
-        Ok((hostname, DEFAULT_HTTPS_PORT))
-    }
-
-    /// 解析HTTP请求获取目标主机和端口
-    fn parse_http_target(request_data: &[u8]) -> Result<(String, u16)> {
-        let request_str = String::from_utf8_lossy(request_data);
-        let lines: Vec<&str> = request_str.lines().collect();
-        
-        if lines.is_empty() {
-            return Err(anyhow::anyhow!("Empty HTTP request"));
-        }
-
-        // 解析第一行获取方法和路径
-        let first_line = lines[0];
-        let parts: Vec<&str> = first_line.split_whitespace().collect();
-        
-        if parts.len() < 2 {
-            return Err(anyhow::anyhow!("Invalid HTTP request line"));
-        }
-
-        let method = parts[0];
-        let url_or_path = parts[1];
-
-        // CONNECT方法直接包含host:port
-        if method == "CONNECT" {
-            let host_port: Vec<&str> = url_or_path.split(':').collect();
-            if host_port.len() == 2 {
-                let host = host_port[0].to_string();
-                let port = host_port[1].parse::<u16>()
-                    .map_err(|_| anyhow::anyhow!("Invalid port in CONNECT: {}", host_port[1]))?;
-                return Ok((host, port));
-            }
-        }
-
-        // 对于其他方法，从Host头获取主机
-        for line in &lines[1..] {
-            if line.to_lowercase().starts_with("host:") {
-                let host_part = line[5..].trim();
-                
-                // 检查是否包含端口
-                if let Some(colon_pos) = host_part.rfind(':') {
-                    let host = host_part[..colon_pos].to_string();
-                    let port_str = &host_part[colon_pos + 1..];
-                    
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        return Ok((host, port));
-                    }
-                }
-                
-                
-                // 没有端口，根据协议推断默认端口
-                // 注意：透明代理应该从原始连接获取端口，而不是从HTTP内容推断
-                let default_port = if url_or_path.starts_with("https://") {
-                    DEFAULT_HTTPS_PORT
-                } else {
-                    // 对于普通HTTP请求，默认使用80端口
-                    // TODO: 理想情况下应该从SO_ORIGINAL_DST或pfctl获取原始目标端口
-                    DEFAULT_HTTP_PORT
-                };
-                
-                return Ok((host_part.to_string(), default_port));
-            }
-        }
-
-        // 如果找不到Host头，尝试从URL解析
-        if url_or_path.starts_with("http://") || url_or_path.starts_with("https://") {
-            if let Ok(url) = url::Url::parse(url_or_path) {
-                let host = url.host_str().unwrap_or("").to_string();
-                let port = url.port().unwrap_or(if url.scheme() == "https" { DEFAULT_HTTPS_PORT } else { DEFAULT_HTTP_PORT });
-                return Ok((host, port));
-            }
-        }
-
-        Err(anyhow::anyhow!("Could not parse target from HTTP request"))
-    }
 
     pub fn get_local_port(&self) -> Option<u16> {
         self.local_port
@@ -756,6 +739,8 @@ impl TransparentServer {
             self.should_stop.load(std::sync::atomic::Ordering::Relaxed)
         )
     }
+
+
 }
 
 impl Drop for TransparentServer {
@@ -769,52 +754,6 @@ impl Drop for TransparentServer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn test_http_target_parsing() {
-        let http_request = b"GET / HTTP/1.1\r\nHost: www.google.com\r\n\r\n";
-        let (host, port) = TransparentServer::parse_http_target(http_request).unwrap();
-        assert_eq!(host, "www.google.com");
-        assert_eq!(port, 80);
-
-        let https_request = b"CONNECT www.google.com:443 HTTP/1.1\r\n\r\n";
-        let (host, port) = TransparentServer::parse_http_target(https_request).unwrap();
-        assert_eq!(host, "www.google.com");
-        assert_eq!(port, 443);
-    }
-
-    #[test]
-    fn test_tls_handshake_detection() {
-        // 模拟TLS Client Hello开头
-        let tls_handshake = [
-            0x16, 0x03, 0x03, // TLS Handshake, version 3.3
-            0x00, 0x20,       // Length
-            0x01,             // Client Hello
-        ];
-        
-        assert!(TransparentServer::is_tls_handshake(&tls_handshake));
-        
-        // HTTP请求不应该被识别为TLS
-        let http_request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        assert!(!TransparentServer::is_tls_handshake(http_request));
-        
-        // 太短的数据包
-        let short_data = [0x16, 0x03];
-        assert!(!TransparentServer::is_tls_handshake(&short_data));
-    }
-
-    #[test]
-    fn test_url_extraction_types() {
-        // HTTP请求的URL提取
-        let http_request = b"GET /api/v1/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
-        let url = TransparentServer::extract_url_from_http_request(http_request).unwrap();
-        assert_eq!(url, "http://api.example.com/api/v1/users");
-        
-        // HTTPS CONNECT请求
-        let https_connect = b"CONNECT secure.example.com:443 HTTP/1.1\r\n\r\n";
-        let url = TransparentServer::extract_url_from_http_request(https_connect).unwrap();
-        assert_eq!(url, "https://secure.example.com:443");
-    }
+    // Tests moved to protocol_handler module
 }
 

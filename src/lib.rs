@@ -8,7 +8,8 @@ pub mod pfctl;
 pub mod transparent_proxy_manager;
 pub mod routing_engine;
 pub mod transparent_server;
-pub mod poc_trans_proxy;
+pub mod protocol_handler;
+pub mod tls_interception;
 
 pub mod user_manager;
 
@@ -20,6 +21,6 @@ pub use status::{TrafficStats, StatsCollector, SimpleStatsCollector};
 
 pub use pfctl::Pfctl;
 pub use transparent_proxy_manager::{TransparentProxyManager};
-pub use routing_engine::{RoutingEngine, RoutingRules, RoutingDecision};
+pub use routing_engine::{RoutingEngine, RoutingRules, RoutingDecision, TlsInterceptionMode};
 pub use transparent_server::TransparentServer;
 pub use user_manager::{UserManager, UserSwitcher};

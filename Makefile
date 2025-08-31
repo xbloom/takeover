@@ -69,3 +69,9 @@ rel:
 	sudo chown root target/release/examples/simple_proxy_server
 	sudo chmod u+s target/release/examples/simple_proxy_server 
 	./target/release/examples/simple_proxy_server
+
+tls:
+	cargo build --release --example complete_tls_proxy_demo
+	sudo chown root target/release/examples/complete_tls_proxy_demo
+	sudo chmod u+s target/release/examples/complete_tls_proxy_demo 
+	./target/release/examples/complete_tls_proxy_demo

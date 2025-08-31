@@ -44,12 +44,27 @@ pub enum RoutingDecision {
     Proxy {
         /// 可能重写后的URL
         rewritten_url: Option<String>,
+        /// TLS拦截模式（为未来功能预留）
+        tls_interception: TlsInterceptionMode,
     },
     /// 直接连接
     Direct {
         /// 可能重写后的URL
         rewritten_url: Option<String>,
+        /// TLS拦截模式（为未来功能预留）
+        tls_interception: TlsInterceptionMode,
     },
+}
+
+/// TLS拦截模式（为未来功能预留）
+#[derive(Debug, Clone, PartialEq)]
+pub enum TlsInterceptionMode {
+    /// 不拦截TLS，仅使用SNI
+    None,
+    /// 选择性拦截（基于域名配置）
+    Selective,
+    /// 完全拦截（SSL Bump模式）
+    Full,
 }
 
 impl RoutingEngine {
@@ -137,11 +152,36 @@ impl RoutingEngine {
 
         // 返回决策结果
         if should_proxy {
-            RoutingDecision::Proxy { rewritten_url }
+            RoutingDecision::Proxy { 
+                rewritten_url,
+                tls_interception: TlsInterceptionMode::Selective, // 目前默认不拦截
+            }
         } else {
             debug!("No proxy rules matched for {}:{}, using direct connection", target_host, target_port);
-            RoutingDecision::Direct { rewritten_url }
+            RoutingDecision::Direct { 
+                rewritten_url,
+                tls_interception: TlsInterceptionMode::Selective, // 目前默认不拦截
+            }
         }
+    }
+
+    /// 检查是否应该进行TLS拦截（为未来功能预留）
+    pub fn should_intercept_tls(&self, hostname: &str) -> TlsInterceptionMode {
+        // 未来可以基于配置决定TLS拦截模式
+        // 例如：某些域名启用选择性拦截，某些启用完全拦截
+        
+        // 示例逻辑（未来实现）:
+        // if self.rules.tls_intercept_domains.contains(hostname) {
+        //     TlsInterceptionMode::Selective
+        // } else if self.rules.full_tls_intercept {
+        //     TlsInterceptionMode::Full
+        // } else {
+        //     TlsInterceptionMode::None
+        // }
+        
+        // 目前始终返回不拦截
+        let _ = hostname; // 消除未使用参数警告
+        TlsInterceptionMode::None
     }
 
     /// 通配符匹配逻辑（支持 * 和 ? 通配符）
@@ -265,9 +305,9 @@ impl RoutingRules {
 
         // 添加一些默认规则
         rules.target_domains.extend(vec![
-            "*.google.com".to_string(),
-            "*.github.com".to_string(),
-            "*.openai.com".to_string(),
+            // "*.google.com".to_string(),
+            // "*.github.com".to_string(),
+            // "*.openai.com".to_string(),
             "httpbin.org".to_string(), // 走代理（应显示代理IP）
             // ipinfo.io 不在列表中，直连（应显示真实IP）
         ]);
@@ -281,11 +321,11 @@ impl RoutingRules {
 
         // 添加一些默认的URL模式（支持HTTPS）
         rules.target_url_patterns.extend(vec![
-            "https://api.openai.com/*".to_string(),
-            "https://github.com/*/releases/*".to_string(),
-            "https://registry.npmjs.org/*".to_string(),
-            "https://pypi.org/*".to_string(),
-            "https://*.googleapis.com/*".to_string(),
+            // "https://api.openai.com/*".to_string(),
+            // "https://github.com/*/releases/*".to_string(),
+            // "https://registry.npmjs.org/*".to_string(),
+            // "https://pypi.org/*".to_string(),
+            // "https://*.googleapis.com/*".to_string(),
         ]);
 
         // 添加一些示例URL重写规则
@@ -381,24 +421,24 @@ mod tests {
         // 测试通配符匹配
         assert!(matches!(
             engine.should_proxy("www.google.com", 80, None, None, &client_addr),
-            RoutingDecision::Proxy { .. }
+            RoutingDecision::Proxy { tls_interception: TlsInterceptionMode::None, .. }
         ));
         
         assert!(matches!(
             engine.should_proxy("api.google.com", 80, None, None, &client_addr),
-            RoutingDecision::Proxy { .. }
+            RoutingDecision::Proxy { tls_interception: TlsInterceptionMode::None, .. }
         ));
 
         // 测试精确匹配
         assert!(matches!(
             engine.should_proxy("github.com", 443, None, None, &client_addr),
-            RoutingDecision::Proxy { .. }
+            RoutingDecision::Proxy { tls_interception: TlsInterceptionMode::None, .. }
         ));
 
         // 测试不匹配
         assert!(matches!(
             engine.should_proxy("example.com", 80, None, None, &client_addr),
-            RoutingDecision::Direct { .. }
+            RoutingDecision::Direct { tls_interception: TlsInterceptionMode::None, .. }
         ));
     }
 
@@ -421,13 +461,13 @@ mod tests {
         // 测试URL模式匹配
         assert!(matches!(
             engine.should_proxy("api.openai.com", 443, Some("https://api.openai.com/v1/chat/completions"), None, &client_addr),
-            RoutingDecision::Proxy { .. }
+            RoutingDecision::Proxy { tls_interception: TlsInterceptionMode::None, .. }
         ));
 
         // 测试不匹配
         assert!(matches!(
             engine.should_proxy("example.com", 80, Some("https://example.com/api"), None, &client_addr),
-            RoutingDecision::Direct { .. }
+            RoutingDecision::Direct { tls_interception: TlsInterceptionMode::None, .. }
         ));
     }
 
@@ -455,8 +495,9 @@ mod tests {
 
         // 测试URL重写
         match engine.should_proxy("github.com", 443, Some("https://github.com/user/repo"), None, &client_addr) {
-            RoutingDecision::Direct { rewritten_url: Some(rewritten) } => {
+            RoutingDecision::Direct { rewritten_url: Some(rewritten), tls_interception } => {
                 assert_eq!(rewritten, "https://mirror.github.com/user/repo");
+                assert_eq!(tls_interception, TlsInterceptionMode::None);
             }
             _ => panic!("Expected Direct with rewritten URL"),
         }

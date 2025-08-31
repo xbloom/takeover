@@ -21,6 +21,15 @@ nix = { version = "0.28", features = ["process", "signal"] }
 libc = "0.2"
 regex = "1.0"
 url = "2.0"
+# TLS 拦截功能依赖 (总是启用，运行时配置)
+async-trait = "0.1"
+rustls = "0.22"
+tokio-rustls = "0.25"
+rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
+rustls-pemfile = "2.0"
+time = "0.3"
+base64 = { version = "0.22.1", registry = "rsproxy" }
+sha1 = { version = "0.10.6", registry = "rsproxy" }
 
 # Platform-specific dependencies
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -39,6 +48,22 @@ path = "src/lib.rs"
 name = "takeover"
 path = "src/main.rs"
 
+[features]
+default = []
+
 [[example]]
 name = "transparent_proxy_demo"
 path = "examples/transparent_proxy_demo.rs"
+
+[[example]]
+name = "tls_interception_demo"
+path = "examples/tls_interception_demo.rs"
+
+[[example]]
+name = "complete_tls_proxy_demo"
+path = "examples/complete_tls_proxy_demo.rs"
+
+
+[[example]]
+name = "simple_tls_test"
+path = "examples/simple_tls_test.rs"
