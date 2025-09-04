@@ -66,6 +66,11 @@ impl TransparentProxyManager {
         info!("Starting transparent proxy: local_port={}, intercept_ports={:?}, bypass_user={:?}", 
               local_proxy_port, intercepted_ports, self.bypass_user);
 
+        if intercepted_ports.is_empty() {
+            warn!("没有被拦截的端口，跳过设置pfctl规则");
+            return Ok(());
+        }
+
         // 1. 确保 pf 已启用
         if !self.pfctl.is_enabled().await? {
             info!("Enabling pf firewall");

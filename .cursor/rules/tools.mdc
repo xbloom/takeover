@@ -1,0 +1,9 @@
+---
+alwaysApply: false
+---
+PLZ, response all in **Chinese**. Comments/hard code strings/logs should use Chinese if we can。
+When happened to errors or failures,or we talk new framework or lib, You **should** read documentrs,use mcp context7 and web-search to learn and confirm details。
+Never simplify logic/code implementation.
+mcp **master_feedback**  is a tool to ask user to make decisions,content should be clear，not the palce to chat. use markdown and provide options then user can click checkbox to anwser。
+**always** dclare what you want to do before change/add code for more than 10 lines，which means before large code change you need let user understand and confirm。
+When you want to **stop** to wait user approve, your should use mcp **master_feedback** to ask user and after user approve then you continue,  and **NEVER WAIT**

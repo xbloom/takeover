@@ -1,0 +1,355 @@
+---
+alwaysApply: true
+---
+
+# Takeover 透明代理 - 六边形架构设计文档
+
+## 📋 文档概述
+
+本文档描述了Takeover透明代理系统的六边形架构设计，包括当前实现状态、待完成任务和详细的实现指导。
+
+**最后更新**: 2024年12月
+**架构版本**: v2.0 (六边形架构重构版本)
+
+## 🎯 架构目标
+
+- **高度可扩展**: 通过端口和适配器模式实现组件解耦
+- **可测试性**: 依赖注入使各组件易于单元测试
+- **灵活配置**: 支持动态中间件管道和规则配置
+- **性能优先**: 异步架构支持高并发透明代理
+- **跨平台兼容**: 抽象化平台特定功能
+
+## 🏗️ 整体架构概览
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     六边形架构 (Hexagonal Architecture)          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐    ┌─────────────────┐    ┌──────────────┐   │
+│  │   入站适配器   │───→│   应用核心       │←───│   出站适配器   │   │
+│  │ InboundPort  │    │   AppCore       │    │ OutboundPort │   │
+│  └──────────────┘    └─────────────────┘    └──────────────┘   │
+│         ↑                      ↑                      ↓         │
+│  ┌──────────────┐    ┌─────────────────┐    ┌──────────────┐   │
+│  │   控制适配器   │    │   中间件管道     │    │   API适配器    │   │
+│  │ ControlPort  │    │   Pipeline      │    │  ApiPort     │   │
+│  └──────────────┘    └─────────────────┘    └──────────────┘   │
+│         ↑                      ↑                      ↓         │
+│  ┌──────────────┐    ┌─────────────────┐    ┌──────────────┐   │
+│  │   事件适配器   │    │   状态管理       │    │   脚本适配器   │   │
+│  │  EventPort   │    │ StateManager    │    │ ScriptPort   │   │
+│  └──────────────┘    └─────────────────┘    └──────────────┘   │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+
+## 📁 代码结构
+### poc阶段
+```
+./examples
+├── complete_tls_proxy_demo.rs
+├── simple_proxy_server.rs
+├── simple_tls_test.rs
+├── test_certificate_generation.rs
+└── transparent_proxy_demo.rs
+├── config.rs
+├── lib.rs
+├── pfctl.rs
+├── protocol_handler.rs
+├── routing_engine.rs
+├── socks5.rs
+├── status.rs
+├── tls_interception.rs
+├── transparent_proxy_manager.rs
+├── transparent_server.rs
+├── user_manager.rs
+└── utils.rs
+```
+### 重构阶段
+```
+src/
+├── core/                    # 核心六边形
+│   ├── mod.rs              # 导出核心组件
+│   ├── model.rs            # 业务模型和数据结构
+│   ├── ports.rs            # 端口接口定义
+│   ├── engine.rs           # 处理引擎和中间件管道
+│   ├── middleware/         # 中间件实现
+│   │   ├── mod.rs
+│   │   ├── tls.rs          # TLS拦截中间件
+│   │   ├── http_parsing.rs # HTTP解析中间件
+│   │   ├── rule_matching.rs# 规则匹配中间件
+│   │   ├── script.rs       # 脚本执行中间件
+│   │   ├── user_intervention.rs # 用户干预中间件
+│   │   ├── http_modification.rs # HTTP修改中间件
+│   │   └── response_merge.rs    # 响应合并中间件
+│   └── services/           # 核心服务
+│       ├── mod.rs
+│       ├── state_manager.rs# 状态管理服务
+│       └── replay_manager.rs # 重放管理服务
+├── adapters/               # 适配器层
+│   ├── mod.rs             # 适配器模块导出
+│   ├── inbound/           # 入站适配器
+│   │   ├── mod.rs
+│   │   └── pf.rs          # macOS pfctl适配器
+│   ├── outbound/          # 出站适配器
+│   │   ├── mod.rs
+│   │   ├── direct.rs      # 直连适配器
+│   │   └── socks5.rs      # SOCKS5代理适配器
+│   ├── control/           # 控制适配器
+│   │   ├── mod.rs
+│   │   └── api.rs         # REST API控制接口
+│   ├── script/            # 脚本适配器
+│   │   ├── mod.rs
+│   │   └── lua_adapter.rs # Lua脚本引擎适配器
+│   ├── api/               # API适配器
+│   │   ├── mod.rs
+│   │   └── lua_api.rs     # Lua API功能适配器
+│   ├── storage/           # 存储适配器
+│   │   └── (待实现)
+│   └── ui/                # UI适配器
+│       └── (待实现)
+├── config.rs              # 配置系统
+├── error.rs               # 错误类型定义
+├── lib.rs                 # 库入口
+└── main.rs                # 应用程序入口点
+```
+
+## 🔄 中间件管道架构
+
+### 处理流程
+
+```
+TCP连接 → TLS拦截 → HTTP/2解析 → 规则匹配 → 脚本执行 → 用户干预 → HTTP修改 → 转发 → 响应合并
+   ↓         ↓         ↓          ↓         ↓         ↓         ↓       ↓         ↓
+  (10)     (15)      (20)       (30)      (35)      (40)     (50)    (60)     (70)
+```
+
+### 中间件优先级与职责
+
+| 优先级 | 中间件名称 | 核心职责 | 输入 | 输出 | 状态 |
+|-------|-----------|----------|------|------|------|
+| 10 | **TlsMiddleware** | TLS握手、证书管理、SSL Bump拦截 | `TcpStream` | `TlsStream`(client) | 🔧 需修复 |
+| 15 | **Http2StreamMiddleware** | HTTP/2协议解析、stream分发 | `InboundTlsStream` | 继续标准pipeline | ✅ 协议解析模式 |
+| 20 | ~~HttpParsingMiddleware~~ | ~~HTTP解析~~ (已废弃) | - | - | ❌ 废弃 |
+| 30 | RuleMatchingMiddleware | 路由规则匹配 | `HttpRequest` | 匹配结果 | 🟡 占位符 |
+| 35 | ScriptMiddleware | Lua脚本执行 | `HttpRequest` | 修改后请求 | 🟡 占位符 |
+| 40 | UserInterventionMiddleware | 用户干预处理 | `HttpRequest` | 用户决策 | 🟡 占位符 |
+| 50 | HttpModificationMiddleware | HTTP请求修改 | `HttpRequest` | 修改后请求 | 🟡 占位符 |
+| 60 | ForwardingMiddleware | 请求转发 | `HttpRequest` | `HttpResponse` | ❌ 未实现 |
+| 70 | ResponseMergeMiddleware | 响应合并 | `HttpResponse` | 最终响应 | 🟡 占位符 |
+
+### 关键架构原则
+
+#### 🔐 **TLS中间件 (优先级10)**
+- **职责边界**: 仅处理TLS层面的加密/解密
+- **输入**: 原始`TcpStream`
+- **处理**: 
+  1. 检测TLS握手 (SNI解析)
+  2. 执行SSL Bump拦截
+  3. 建立双向TLS连接
+- **输出**: `(inbound_tls_stream, outbound_tls_stream)`
+- **存储**: 将TLS流存入`Connection.inbound_tls_stream`和`Connection.outbound_tls_stream`
+
+#### 🌐 **HTTP/2流中间件 (优先级15) - 协议解析与统一处理模式**
+- **职责边界**: HTTP/2协议解析和stream转换，保持分层架构清晰
+- **输入**: 来自TLS中间件的`inbound_tls_stream`
+- **处理模式**:
+  1. **协议监听**: 进入HTTP/2连接循环，监听新的stream到达
+  2. **请求转换**: 将每个HTTP/2 stream转换为标准`HttpRequest`对象
+  3. **上下文复用**: 使用相同的`ConnectionContext`，只替换`request`字段
+  4. **标准处理**: 每个stream继续执行标准的业务pipeline(优先级20+)
+- **架构特性**:
+  - **连接复用**: `Connection`对象在所有stream间共享
+  - **请求独立**: 每个stream有独立的`HttpRequest`对象
+  - **业务统一**: HTTP/1.1和HTTP/2请求走相同的业务逻辑
+  - **并发处理**: 多个stream并发执行业务pipeline
+- **实现策略**: 使用hyper HTTP/2服务，为每个stream spawn标准业务处理
+
+#### 🎯 **业务中间件 (优先级20+)**
+- **职责边界**: 处理业务逻辑、规则匹配、内容修改
+- **输入**: 标准`HttpRequest`对象
+- **处理**: 规则匹配、脚本执行、用户干预、内容修改
+- **输出**: 修改后的`HttpRequest`或`HttpResponse`
+
+## 🔄 HTTPS + HTTP/2 架构决策
+
+### 核心假设
+- **主流协议**: HTTPS + HTTP/2 (多路复用)
+- **性能优先**: 低延迟 + 高并发
+- **现代化**: 支持TLS 1.3, HTTP/2, 未来HTTP/3
+
+### 关键架构决策
+
+| 维度 | 决策 | 原因 |
+|------|------|------|
+| **连接模型** | 分层连接 | HTTP/2多路复用需要 |
+| **数据流** | 推拉混合 | 帧级推送 + 流级拉取 |
+| **协议解析** | 分层解析 | TLS→HTTP/2→业务分离 |
+| **并发模型** | 流级并发 | 充分利用HTTP/2优势 |
+| **状态管理** | 分级状态 | 连接有状态 + 流无状态 |
+| **性能权衡** | 关键路径零拷贝 | 协议层高性能 + 业务层易用 |
+
+### 统一分层架构
+
+```
+主Pipeline (单次执行):
+┌─────────────────┐
+│  TCP 连接层     │ ← 透明代理、连接建立
+├─────────────────┤
+│  TLS 终止层     │ ← HTTPS握手、证书管理 (一次性)
+├─────────────────┤  
+│  HTTP/2 解析层  │ ← 协议解析、stream监听
+└─────────────────┘
+         │
+         │ 每个stream: 复用ConnectionContext + 独立HttpRequest
+         ↓
+业务Pipeline (并发实例):
+┌─────────────────┐
+│  规则匹配       │ ← 路由规则、访问控制
+├─────────────────┤
+│  脚本执行       │ ← Lua脚本处理
+├─────────────────┤
+│  用户干预       │ ← 人工审批
+├─────────────────┤
+│  HTTP修改       │ ← 请求/响应修改
+├─────────────────┤
+│  转发处理       │ ← 出站连接
+├─────────────────┤
+│  响应合并       │ ← 响应处理
+└─────────────────┘
+```
+
+### 核心数据结构
+
+```rust
+// 分层连接模型 - 实际实现
+pub struct Connection {
+    pub id: ConnectionId,
+    pub source_addr: SocketAddr,
+    pub original_dest: SocketAddr,
+    pub metadata: ConnectionMetadata,
+    
+    // 原始TCP流
+    #[serde(skip)]
+    pub stream: Option<TcpStream>,
+    
+    // TLS拦截后的双向流
+    #[serde(skip)]
+    pub inbound_tls_stream: Option<Box<dyn TlsStream>>, // 客户端TLS流(已解密)
+    #[serde(skip)]  
+    pub outbound_tls_stream: Option<Box<dyn TlsStream>>, // 服务器TLS流
+}
+
+// 中间件处理流程
+TCP连接 → TLS中间件 → HTTP/2中间件 → 业务中间件
+   ↓           ↓            ↓             ↓
+TcpStream → TlsStream → HttpRequest → 业务逻辑
+
+// 中间件接口保持统一
+trait Middleware {
+  async fn process(
+    &self, 
+    context: &mut ConnectionContext, 
+    core: &AppCore
+  ) -> Result<MiddlewareResult>;
+}
+```
+
+### 数据流转详解
+
+#### 🔄 **阶段1: TCP → TLS拦截**
+```rust
+// TLS中间件处理
+let tcp_stream = context.connection.stream.take()?;
+let (client_tls, server_tls) = tls_manager.intercept(
+    tcp_stream, 
+    &context.target_host, 
+    context.target_port
+).await?;
+
+// 存储TLS流
+context.connection.inbound_tls_stream = Some(client_tls);
+context.connection.outbound_tls_stream = Some(server_tls);
+```
+
+#### 🔄 **阶段2: TLS → HTTP/2协议解析与分发**
+```rust
+// HTTP/2中间件进入监听循环，为每个stream创建标准处理
+impl Http2StreamMiddleware {
+    async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
+        let tls_stream = context.connection.inbound_tls_stream.take()?;
+        
+        // 进入HTTP/2监听循环
+        self.http2_connection_loop(tls_stream, context, core).await?;
+        
+        // 连接关闭后返回
+        Ok(MiddlewareResult::Stop)
+    }
+    
+    async fn http2_connection_loop(&self, tls_stream: TlsStream, base_context: &ConnectionContext, core: &AppCore) {
+        let service = service_fn(move |req: Request<Incoming>| {
+            let base_context = base_context.clone();
+            let core = core.clone();
+            
+            async move {
+                // 转换HTTP/2 stream为HttpRequest
+                let http_request = self.convert_hyper_request(req).await?;
+                
+                // 🎯 复用ConnectionContext，只替换request
+                let mut stream_context = base_context;
+                stream_context.request = Some(http_request);
+                stream_context.custom_data.insert("stream_id".to_string(), serde_json::json!(stream_id));
+                
+                // 🔥 继续标准的业务pipeline处理(从优先级20开始)
+                self.continue_standard_pipeline(stream_context, core).await;
+                
+                Ok(Response::builder().status(200).body(Full::new(Bytes::from("OK"))).unwrap())
+            }
+        });
+        
+        // HTTP/2连接处理 - 持续监听直到连接关闭
+        http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(tls_stream), service)
+            .await?;
+    }
+}
+```
+
+#### 🔄 **阶段3: 统一的业务处理**
+```rust
+// 每个HTTP/2流执行相同的标准业务Pipeline
+标准Pipeline流程:
+  HttpRequest → 规则匹配 → 脚本执行 → 用户干预 → HTTP修改 → 转发 → 响应处理
+
+// Engine的标准处理方法(无需特殊化)
+impl ProcessingEngine {
+    async fn continue_from_priority(&self, context: &mut ConnectionContext, core: &AppCore, start_priority: i32) -> Result<MiddlewareResult> {
+        for middleware in &self.middlewares {
+            if middleware.priority() < start_priority {
+                continue;
+            }
+            
+            match middleware.process(context, core).await? {
+                MiddlewareResult::Continue => continue,
+                other => return Ok(other),
+            }
+        }
+        Ok(MiddlewareResult::Continue)
+    }
+}
+```
+
+### 实施策略
+1. **使用hyper**: 处理HTTP/2复杂性和多路复用
+2. **使用rustls**: 高性能TLS实现，具体类型集成
+3. **统一Pipeline**: 所有HTTP请求(HTTP/1.1和HTTP/2)走相同的业务pipeline
+4. **分层职责**: 每个中间件只负责自己的协议层，保持职责单一
+5. **零拷贝优化**: 关键路径避免内存拷贝
+6. **并发处理**: HTTP/2多stream并发执行业务逻辑，充分利用多路复用优势
+
+## 核心类库使用
+
+### rust类库
+tokio， hyper， reqwest，rustls， serde_json， tracing， mlua

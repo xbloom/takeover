@@ -14,6 +14,12 @@ pub enum TakeoverError {
     #[error("Proxy error: {0}")]
     Proxy(String),
     
+    #[error("Script error: {0}")]
+    Script(String),
+    
+    #[error("Lua error: {0}")]
+    Lua(#[from] mlua::Error),
+    
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
     

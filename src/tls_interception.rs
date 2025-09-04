@@ -175,7 +175,7 @@ impl RustlsCertificateManager {
     
     /// 生成新的根CA证书和颁发者 (使用正确的rcgen API和完整扩展)
     fn generate_root_ca(&self) -> Result<(Issuer<'static, KeyPair>, String, String)> {
-        info!("🔐 Generating new root CA certificate with complete extensions...");
+        debug!("🔐 Generating new root CA certificate with complete extensions...");
         
         // 创建证书参数
         let mut params = CertificateParams::new(vec![
@@ -221,12 +221,7 @@ impl RustlsCertificateManager {
         // 创建Issuer对象用于签名其他证书
         let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)?;
         
-        info!("✅ Generated root CA certificate with:");
-        info!("   📋 Subject: CN=Takeover Root CA, O=Takeover Proxy, C=US");
-        info!("   🏢 CA: true (can sign other certificates)");
-        info!("   🔑 Key Usage: Digital Signature, Certificate Sign, CRL Sign");
-        info!("   🎯 Extended Key Usage: Server Auth, Client Auth");
-        info!("   📅 Valid: 2024-2034 (10 years)");
+        debug!("Generated root CA certificate (Subject: CN=Takeover Root CA, O=Takeover Proxy, C=US, Valid: 2024-2034)");
         
         Ok((issuer, cert_pem, key_pem))
     }
@@ -235,7 +230,7 @@ impl RustlsCertificateManager {
     
     /// 为指定域名生成证书 (由根CA签名，包含完整的Chrome信任扩展)
     fn generate_domain_cert(&self, domain: &str) -> Result<TlsCertificate> {
-        info!("🔐 Generating CA-signed certificate for domain: {} with Chrome-compatible extensions", domain);
+        debug!("🔐 Generating CA-signed certificate for domain: {}", domain);
         
         // 获取根CA颁发者
         let binding = self.root_ca_issuer.lock().unwrap();
@@ -306,15 +301,7 @@ impl RustlsCertificateManager {
             not_after: now + chrono::Duration::days(365), // 1年有效期
         };
         
-        info!("✅ Generated CA-signed certificate for domain: {} with Chrome-compatible extensions:", domain);
-        info!("   📋 Subject: CN={}, O=Takeover Proxy, C=US", domain);
-        info!("   📋 Issuer: CN=Takeover Root CA, O=Takeover Proxy, C=US (CA-signed!)");
-        info!("   🎯 SAN: {} (required by Chrome)", domain);
-        info!("   🔑 Key Usage: Digital Signature, Key Encipherment, Key Agreement");
-        info!("   🎯 Extended Key Usage: Server Auth, Client Auth (Chrome compatible)");
-        info!("   🏢 Basic Constraints: CA:FALSE (end-entity certificate)");
-        info!("   📅 Valid: 2024-2025 (1 year)");
-        info!("   🎯 Certificate Chain: Root CA -> Domain Certificate (proper trust chain!)");
+        debug!("Generated CA-signed certificate for domain: {} (Subject: CN={}, O=Takeover Proxy, C=US)", domain, domain);
         
         Ok(tls_cert)
     }
@@ -333,10 +320,7 @@ impl RustlsCertificateManager {
         
         // 🎯 读取已存在的证书和私钥文件
         if std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists() {
-            info!("✅ Found existing root CA files");
-            info!("   📄 Certificate: {}", cert_path);
-            info!("   🔑 Private key: {}", key_path);
-            info!("   🔄 Loading from files...");
+            debug!("Found existing root CA files: cert={}, key={}", cert_path, key_path);
             
             // 读取PEM文件内容
             let cert_pem = std::fs::read_to_string(&cert_path)?;
@@ -346,8 +330,7 @@ impl RustlsCertificateManager {
             let key_pair = KeyPair::from_pem(&key_pem)?;
             let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)?;
             
-            info!("🎯 Successfully loaded existing root CA certificate!");
-            info!("   📜 Created Issuer object from existing PEM files");
+            debug!("Successfully loaded existing root CA certificate");
             
             *cert_pem_guard = Some(cert_pem);
             *issuer_guard = Some(issuer);
@@ -356,20 +339,20 @@ impl RustlsCertificateManager {
         }
         
         // 如果文件不存在，生成新的根CA
-        info!("🔐 Generating new root CA certificate...");
+        debug!("🔐 Generating new root CA certificate...");
         let (issuer, cert_pem, key_pem) = self.generate_root_ca()?;
         
         // 保存证书和密钥到文件
         if let Err(e) = std::fs::write(&cert_path, &cert_pem) {
             warn!("Failed to save root CA certificate: {}", e);
         } else {
-            info!("📄 Root CA certificate saved to: {}", cert_path);
+            debug!("📄 Root CA certificate saved to: {}", cert_path);
         }
         
         if let Err(e) = std::fs::write(&key_path, &key_pem) {
             warn!("Failed to save root CA private key: {}", e);
         } else {
-            info!("🔑 Root CA private key saved to: {}", key_path);
+            debug!("🔑 Root CA private key saved to: {}", key_path);
         }
         
         // 存储到内存中
@@ -407,7 +390,7 @@ impl CertificateManager for RustlsCertificateManager {
             cache.insert(domain.to_string(), cert.clone());
         }
         
-        info!("Generated and cached new certificate for domain: {}", domain);
+        debug!("Generated and cached new certificate for domain: {}", domain);
         Ok(cert)
     }
     
@@ -438,7 +421,7 @@ impl CertificateManager for RustlsCertificateManager {
         // 在macOS上使用管理员权限安装到系统钥匙串
         #[cfg(target_os = "macos")]
         {
-            info!("🔐 正在将根CA证书安装到系统信任存储...");
+            debug!("🔐 正在将根CA证书安装到系统信任存储...");
             
             // 使用管理员权限安装证书
             match utils::execute_admin_command(
@@ -447,7 +430,7 @@ impl CertificateManager for RustlsCertificateManager {
             ) {
                 Ok(output) => {
                     if output.status.success() {
-                        info!("✅ 根CA证书已成功安装到系统信任存储");
+                        debug!("✅  根CA证书已成功安装到系统信任存储");
                     } else {
                         let error_msg = String::from_utf8_lossy(&output.stderr);
                         warn!("❌ 根CA证书安装失败: {}", error_msg);
