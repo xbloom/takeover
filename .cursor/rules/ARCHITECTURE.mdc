@@ -121,26 +121,46 @@ src/
 ### 处理流程
 
 ```
-TCP连接 → TLS拦截 → HTTP/2解析 → 规则匹配 → 脚本执行 → 用户干预 → HTTP修改 → 转发 → 响应合并
-   ↓         ↓         ↓          ↓         ↓         ↓         ↓       ↓         ↓
-  (10)     (15)      (20)       (30)      (35)      (40)     (50)    (60)     (70)
+协议检测 → TLS拦截 → HTTP协议解析 → 规则匹配 → 脚本执行 → 用户干预 → HTTP修改 → 转发 → 响应合并 → 响应写回
+   ↓         ↓         ↓            ↓         ↓         ↓         ↓       ↓         ↓         ↓
+  (5)      (10)    (15/16)        (30)      (35)      (40)     (50)    (60)     (70)      (75)
+
+分支处理:
+├─ 协议检测(5) → 非HTTP协议 → Copy Pipe透传 → Stop
+├─ HTTP/2(15) → hyper处理完整生命周期 → Stop  
+└─ HTTP/1.1(16) → 标准业务Pipeline → 响应写回(75)
 ```
 
 ### 中间件优先级与职责
 
 | 优先级 | 中间件名称 | 核心职责 | 输入 | 输出 | 状态 |
 |-------|-----------|----------|------|------|------|
-| 10 | **TlsMiddleware** | TLS握手、证书管理、SSL Bump拦截 | `TcpStream` | `TlsStream`(client) | 🔧 需修复 |
-| 15 | **Http2StreamMiddleware** | HTTP/2协议解析、stream分发 | `InboundTlsStream` | 继续标准pipeline | ✅ 协议解析模式 |
-| 20 | ~~HttpParsingMiddleware~~ | ~~HTTP解析~~ (已废弃) | - | - | ❌ 废弃 |
-| 30 | RuleMatchingMiddleware | 路由规则匹配 | `HttpRequest` | 匹配结果 | 🟡 占位符 |
-| 35 | ScriptMiddleware | Lua脚本执行 | `HttpRequest` | 修改后请求 | 🟡 占位符 |
-| 40 | UserInterventionMiddleware | 用户干预处理 | `HttpRequest` | 用户决策 | 🟡 占位符 |
-| 50 | HttpModificationMiddleware | HTTP请求修改 | `HttpRequest` | 修改后请求 | 🟡 占位符 |
-| 60 | ForwardingMiddleware | 请求转发 | `HttpRequest` | `HttpResponse` | ❌ 未实现 |
-| 70 | ResponseMergeMiddleware | 响应合并 | `HttpResponse` | 最终响应 | 🟡 占位符 |
+| 5 | **ProtocolDetectionMiddleware** | 协议检测、非HTTP透传、Copy Pipe | `TcpStream` | 协议分流 | 🟡 待实现 |
+| 10 | **TlsMiddleware** | TLS握手、证书管理、SSL Bump拦截 | `TcpStream` | `TlsStream`(client) | ✅ 已实现 |
+| 15 | **Http2StreamMiddleware** | HTTP/2协议解析、hyper生命周期管理 | `InboundTlsStream` | Stop (接管连接) | ✅ 已实现 |
+| 16 | **Http1StreamMiddleware** | HTTP/1.1协议解析、请求对象生成 | `TlsStream/TcpStream` | `HttpRequest` | ✅ 已实现 |
+| 30 | **RuleMatchingMiddleware** | 路由规则匹配、访问控制 | `HttpRequest` | 匹配结果 | 🟡 占位符 |
+| 35 | **ScriptMiddleware** | Lua脚本执行、请求处理 | `HttpRequest` | 修改后请求 | 🟡 占位符 |
+| 40 | **UserInterventionMiddleware** | 用户干预处理、人工审批 | `HttpRequest` | 用户决策 | 🟡 占位符 |
+| 50 | **HttpModificationMiddleware** | HTTP请求/响应修改 | `HttpRequest` | 修改后请求 | 🟡 占位符 |
+| 60 | **ForwardingMiddleware** | 请求转发、出站连接 | `HttpRequest` | `HttpResponse` | ✅ 已实现 |
+| 70 | **ResponseMergeMiddleware** | 响应合并、后处理 | `HttpResponse` | 最终响应 | 🟡 占位符 |
+| 75 | **ResponseWriteBackMiddleware** | 统一响应写回、协议输出 | `HttpResponse` | 写回客户端 | 🟡 待实现 |
 
 ### 关键架构原则
+
+#### 🔍 **协议检测中间件 (优先级5) - 早期分流架构**
+- **职责边界**: 最早期的协议识别和流量分流
+- **输入**: 原始`TcpStream`
+- **处理逻辑**: 
+  1. **非侵入检测**: 使用TCP peek检测协议特征
+  2. **TLS检测**: 识别TLS握手包 (0x16, 0x03, 0x01-0x04)
+  3. **HTTP明文检测**: 识别HTTP方法开头 (GET, POST等)
+  4. **其他协议检测**: SSH, 数据库协议等
+- **分流策略**:
+  - **HTTP协议**: Continue → 后续HTTP处理
+  - **非HTTP协议**: Copy Pipe透传 → Stop
+- **架构价值**: 避免非HTTP流量进入复杂的HTTP处理管道
 
 #### 🔐 **TLS中间件 (优先级10)**
 - **职责边界**: 仅处理TLS层面的加密/解密
@@ -149,29 +169,53 @@ TCP连接 → TLS拦截 → HTTP/2解析 → 规则匹配 → 脚本执行 → �
   1. 检测TLS握手 (SNI解析)
   2. 执行SSL Bump拦截
   3. 建立双向TLS连接
-- **输出**: `(inbound_tls_stream, outbound_tls_stream)`
+  4. **ALPN协商**: 确定应用层协议
+- **输出**: `(inbound_tls_stream, outbound_tls_stream)` + ALPN结果
 - **存储**: 将TLS流存入`Connection.inbound_tls_stream`和`Connection.outbound_tls_stream`
 
-#### 🌐 **HTTP/2流中间件 (优先级15) - 协议解析与统一处理模式**
-- **职责边界**: HTTP/2协议解析和stream转换，保持分层架构清晰
-- **输入**: 来自TLS中间件的`inbound_tls_stream`
+#### 🌐 **HTTP/2流中间件 (优先级15) - 复杂协议接管模式**
+- **职责边界**: HTTP/2协议完整生命周期管理
+- **输入**: 来自TLS中间件的`inbound_tls_stream` + ALPN=h2
 - **处理模式**:
-  1. **协议监听**: 进入HTTP/2连接循环，监听新的stream到达
-  2. **请求转换**: 将每个HTTP/2 stream转换为标准`HttpRequest`对象
-  3. **上下文复用**: 使用相同的`ConnectionContext`，只替换`request`字段
-  4. **标准处理**: 每个stream继续执行标准的业务pipeline(优先级20+)
+  1. **协议验证**: 检查ALPN协商结果
+  2. **连接接管**: 取出TLS流，进入hyper HTTP/2服务
+  3. **流处理**: 为每个HTTP/2 stream spawn子Pipeline
+  4. **响应管理**: hyper自动处理响应写回
 - **架构特性**:
-  - **连接复用**: `Connection`对象在所有stream间共享
-  - **请求独立**: 每个stream有独立的`HttpRequest`对象
-  - **业务统一**: HTTP/1.1和HTTP/2请求走相同的业务逻辑
-  - **并发处理**: 多个stream并发执行业务pipeline
-- **实现策略**: 使用hyper HTTP/2服务，为每个stream spawn标准业务处理
+  - **完整接管**: Stop后续中间件，自主管理连接生命周期
+  - **子Pipeline**: 每个stream执行业务逻辑(优先级30+)
+  - **并发处理**: 多个stream并发执行
+- **实现策略**: 使用hyper HTTP/2服务处理协议复杂性
 
-#### 🎯 **业务中间件 (优先级20+)**
+#### 🌐 **HTTP/1.1流中间件 (优先级16) - 简单协议解析模式**
+- **职责边界**: HTTP/1.1协议解析，生成标准请求对象
+- **输入**: `TlsStream`(HTTPS) 或 `TcpStream`(HTTP)
+- **处理模式**:
+  1. **协议验证**: 检查ALPN=http/1.1 或明文HTTP特征
+  2. **请求解析**: 读取HTTP请求行、头部、body
+  3. **对象生成**: 创建标准`HttpRequest`对象
+  4. **流保持**: 保持流状态，供后续响应写回使用
+- **架构特性**:
+  - **标准Pipeline**: Continue到业务中间件(30-70)
+  - **流状态保持**: 不接管连接，保持在context中
+  - **协议简单**: 一对一请求响应模式
+- **实现策略**: 手动解析HTTP/1.1协议，输出标准对象
+
+#### 🎯 **业务中间件 (优先级30-70)**
 - **职责边界**: 处理业务逻辑、规则匹配、内容修改
 - **输入**: 标准`HttpRequest`对象
-- **处理**: 规则匹配、脚本执行、用户干预、内容修改
+- **处理**: 规则匹配、脚本执行、用户干预、内容修改、转发
 - **输出**: 修改后的`HttpRequest`或`HttpResponse`
+
+#### 📤 **响应写回中间件 (优先级75) - 统一输出架构**
+- **职责边界**: 检测协议类型，统一响应写回处理
+- **输入**: `HttpResponse`对象 + 连接上下文
+- **处理逻辑**:
+  1. **协议检测**: 判断TLS/TCP连接类型
+  2. **HTTP/2跳过**: 已被hyper处理，无需处理
+  3. **HTTP/1.1写回**: 格式化HTTP响应，写回TLS/TCP流
+  4. **连接管理**: 处理keep-alive、连接关闭等
+- **架构价值**: 统一响应输出，补全HTTP/1.1响应写回缺口
 
 ## 🔄 HTTPS + HTTP/2 架构决策
 
@@ -242,10 +286,13 @@ pub struct Connection {
     pub outbound_tls_stream: Option<Box<dyn TlsStream>>, // 服务器TLS流
 }
 
-// 中间件处理流程
-TCP连接 → TLS中间件 → HTTP/2中间件 → 业务中间件
-   ↓           ↓            ↓             ↓
-TcpStream → TlsStream → HttpRequest → 业务逻辑
+// 新的分支中间件处理流程
+TCP连接 → 协议检测 → [分支处理]
+   ↓           ↓         ↓
+TcpStream → Protocol → Branch1: Copy Pipe (非HTTP) → Stop
+                    → Branch2: TLS → HTTP/2 → Stop (hyper接管)
+                    → Branch3: TLS → HTTP/1.1 → 业务Pipeline → 响应写回
+                    → Branch4: HTTP/1.1明文 → 业务Pipeline → 响应写回
 
 // 中间件接口保持统一
 trait Middleware {
@@ -259,95 +306,165 @@ trait Middleware {
 
 ### 数据流转详解
 
-#### 🔄 **阶段1: TCP → TLS拦截**
+#### 🔍 **阶段0: 协议检测与早期分流**
 ```rust
-// TLS中间件处理
-let tcp_stream = context.connection.stream.take()?;
-let (client_tls, server_tls) = tls_manager.intercept(
-    tcp_stream, 
-    &context.target_host, 
-    context.target_port
-).await?;
-
-// 存储TLS流
-context.connection.inbound_tls_stream = Some(client_tls);
-context.connection.outbound_tls_stream = Some(server_tls);
-```
-
-#### 🔄 **阶段2: TLS → HTTP/2协议解析与分发**
-```rust
-// HTTP/2中间件进入监听循环，为每个stream创建标准处理
-impl Http2StreamMiddleware {
+// 协议检测中间件 (优先级5)
+impl ProtocolDetectionMiddleware {
     async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
-        let tls_stream = context.connection.inbound_tls_stream.take()?;
+        let tcp_stream = context.connection.stream.as_ref()?;
         
-        // 进入HTTP/2监听循环
-        self.http2_connection_loop(tls_stream, context, core).await?;
+        // 非侵入式协议检测
+        let protocol = self.peek_and_detect_protocol(tcp_stream).await?;
         
-        // 连接关闭后返回
-        Ok(MiddlewareResult::Stop)
-    }
-    
-    async fn http2_connection_loop(&self, tls_stream: TlsStream, base_context: &ConnectionContext, core: &AppCore) {
-        let service = service_fn(move |req: Request<Incoming>| {
-            let base_context = base_context.clone();
-            let core = core.clone();
-            
-            async move {
-                // 转换HTTP/2 stream为HttpRequest
-                let http_request = self.convert_hyper_request(req).await?;
-                
-                // 🎯 复用ConnectionContext，只替换request
-                let mut stream_context = base_context;
-                stream_context.request = Some(http_request);
-                stream_context.custom_data.insert("stream_id".to_string(), serde_json::json!(stream_id));
-                
-                // 🔥 继续标准的业务pipeline处理(从优先级20开始)
-                self.continue_standard_pipeline(stream_context, core).await;
-                
-                Ok(Response::builder().status(200).body(Full::new(Bytes::from("OK"))).unwrap())
+        match protocol {
+            ProtocolType::Tls | ProtocolType::HttpCleartext => {
+                // HTTP相关协议，继续后续处理
+                Ok(MiddlewareResult::Continue)
             }
-        });
-        
-        // HTTP/2连接处理 - 持续监听直到连接关闭
-        http2::Builder::new(TokioExecutor::new())
-            .serve_connection(TokioIo::new(tls_stream), service)
-            .await?;
+            _ => {
+                // 非HTTP协议，启动Copy Pipe透传
+                let client_stream = context.connection.stream.take()?;
+                self.start_copy_pipe(client_stream, context, core).await?;
+                Ok(MiddlewareResult::Stop)
+            }
+        }
     }
 }
 ```
 
-#### 🔄 **阶段3: 统一的业务处理**
+#### 🔐 **阶段1: TLS拦截（可选）**
 ```rust
-// 每个HTTP/2流执行相同的标准业务Pipeline
-标准Pipeline流程:
-  HttpRequest → 规则匹配 → 脚本执行 → 用户干预 → HTTP修改 → 转发 → 响应处理
-
-// Engine的标准处理方法(无需特殊化)
-impl ProcessingEngine {
-    async fn continue_from_priority(&self, context: &mut ConnectionContext, core: &AppCore, start_priority: i32) -> Result<MiddlewareResult> {
-        for middleware in &self.middlewares {
-            if middleware.priority() < start_priority {
-                continue;
-            }
-            
-            match middleware.process(context, core).await? {
-                MiddlewareResult::Continue => continue,
-                other => return Ok(other),
-            }
+// TLS中间件 (优先级10) - 只处理HTTPS连接
+impl TlsMiddleware {
+    async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
+        if !self.detect_tls_handshake(context).await {
+            return Ok(MiddlewareResult::Continue); // 跳过非TLS连接
         }
+        
+        let tcp_stream = context.connection.stream.take()?;
+        let (client_tls, _server_tls) = self.perform_tls_interception(tcp_stream, context).await?;
+        
+        // 存储TLS流和ALPN结果
+        context.connection.inbound_tls_stream = Some(client_tls);
+        context.custom_data.insert("alpn_protocol", alpn_result);
+        
+        Ok(MiddlewareResult::Continue)
+    }
+}
+```
+
+#### 🌐 **阶段2A: HTTP/2协议处理（分支1 - 复杂协议）**
+```rust
+// HTTP/2中间件 (优先级15) - 接管完整连接生命周期
+impl Http2StreamMiddleware {
+    async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
+        // 检查ALPN协商结果
+        if !self.is_http2_protocol(context).await {
+            return Ok(MiddlewareResult::Continue);
+        }
+        
+        let tls_stream = context.connection.inbound_tls_stream.take()?;
+        
+        // 启动HTTP/2连接处理（完整接管）
+        self.handle_https_connection(config, tls_stream, context.clone(), core.clone()).await?;
+        
+        // 连接由hyper管理，停止后续中间件
+        Ok(MiddlewareResult::Stop)
+    }
+}
+```
+
+#### 🌐 **阶段2B: HTTP/1.1协议处理（分支2 - 简单协议）**
+```rust
+// HTTP/1.1中间件 (优先级16) - 解析后继续Pipeline
+impl Http1StreamMiddleware {
+    async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
+        if !self.is_http1_protocol(context).await {
+            return Ok(MiddlewareResult::Continue);
+        }
+        
+        // 解析HTTP/1.1请求（支持TLS和明文）
+        let http_request = self.read_http1_request(context).await?;
+        context.request = Some(http_request);
+        
+        // 继续业务Pipeline处理
+        Ok(MiddlewareResult::Continue)
+    }
+}
+```
+
+#### 🎯 **阶段3: 统一业务处理（所有HTTP连接）**
+```rust
+// 业务中间件Pipeline (优先级30-70) - HTTP/1.1和HTTP/2统一处理
+Pipeline流程:
+  HttpRequest → 规则匹配(30) → 脚本执行(35) → 用户干预(40) 
+            → HTTP修改(50) → 转发(60) → 响应合并(70)
+
+// 示例：转发中间件
+impl ForwardingMiddleware {
+    async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
+        let request = context.request.as_ref()?;
+        let response = self.forward_request(context, core).await?;
+        context.response = Some(response);
+        
+        Ok(MiddlewareResult::Continue)
+    }
+}
+```
+
+#### 📤 **阶段4: 响应写回（仅HTTP/1.1）**
+```rust
+// 响应写回中间件 (优先级75) - 统一输出处理
+impl ResponseWriteBackMiddleware {
+    async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
+        // HTTP/2由hyper处理，跳过
+        if context.custom_data.contains_key("http2_processing") {
+            return Ok(MiddlewareResult::Continue);
+        }
+        
+        let response = context.response.as_ref()?;
+        
+        // 检测连接类型并写回
+        if let Some(ref mut tls_stream) = context.connection.inbound_tls_stream {
+            // HTTPS写回
+            self.write_http_response(tls_stream, response).await?;
+        } else if let Some(ref mut tcp_stream) = context.connection.stream {
+            // HTTP写回
+            self.write_http_response(tcp_stream, response).await?;
+        }
+        
         Ok(MiddlewareResult::Continue)
     }
 }
 ```
 
 ### 实施策略
-1. **使用hyper**: 处理HTTP/2复杂性和多路复用
-2. **使用rustls**: 高性能TLS实现，具体类型集成
-3. **统一Pipeline**: 所有HTTP请求(HTTP/1.1和HTTP/2)走相同的业务pipeline
-4. **分层职责**: 每个中间件只负责自己的协议层，保持职责单一
-5. **零拷贝优化**: 关键路径避免内存拷贝
-6. **并发处理**: HTTP/2多stream并发执行业务逻辑，充分利用多路复用优势
+
+#### **架构实施原则**
+1. **早期分流**: 协议检测前置，避免非HTTP流量进入复杂处理管道
+2. **分支处理**: 不同协议采用最适合的处理策略
+3. **职责单一**: 每个中间件专注单一职责，保持架构清晰
+4. **最小侵入**: 保持现有业务逻辑不变，仅补充缺失组件
+
+#### **协议处理策略**
+1. **Copy Pipe透传**: 非HTTP协议直接双向转发，零解析开销
+2. **HTTP/2复杂协议**: 使用hyper完整接管，处理多路复用复杂性
+3. **HTTP/1.1简单协议**: 手动解析 + 标准Pipeline + 统一写回
+4. **TLS拦截**: 按需拦截，支持ALPN协商确定应用层协议
+
+#### **性能优化策略**
+1. **零拷贝**: 关键路径避免不必要的内存拷贝
+2. **并发处理**: HTTP/2多stream并发，Copy Pipe双向并发
+3. **协议检测优化**: 使用peek非侵入式检测，避免数据消耗
+4. **资源管理**: 及时释放不需要的流资源
+
+#### **技术栈选择**
+1. **协议处理**: hyper (HTTP/2), 手动解析 (HTTP/1.1)
+2. **TLS处理**: rustls + tokio-rustls
+3. **异步运行时**: tokio
+4. **序列化**: serde_json
+5. **日志**: tracing
+6. **脚本引擎**: mlua
 
 ## 核心类库使用
 

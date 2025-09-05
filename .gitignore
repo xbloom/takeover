@@ -88,6 +88,4 @@ test_*.sh
 callgrind.out.*
 perf.data*
 
-# Core dumps
-core
-core.*
+
