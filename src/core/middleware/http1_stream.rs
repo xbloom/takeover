@@ -76,12 +76,28 @@ impl Http1StreamMiddleware {
     /// 检查是否为HTTP/1.1协议
     /// 
     /// 通过以下方式检测HTTP/1.1：
+    /// 0. 检查协议检测中间件的结果 (最优先) - 最可靠的协议识别
     /// 1. 检查ALPN协商结果 (优先) - 用于HTTPS
     /// 2. 检查连接元数据中的协议信息
     /// 3. 检查端口号和TLS状态 (基本推断)
     /// 4. 检查普通HTTP端口 (80等) - 用于HTTP
     #[instrument(skip(self, context))]
     async fn is_http1_protocol(&self, context: &ConnectionContext) -> bool {
+        // 方法0：检查协议检测中间件的结果 - 最优先和最可靠
+        if let Some(detected_protocol) = context.custom_data.get("detected_protocol") {
+            if let Some(protocol) = detected_protocol.as_str() {
+                debug!("🔍 协议检测中间件结果: {}", protocol);
+                if protocol == "httpcleartext" {
+                    debug!("🔍 协议检测中间件确认为HTTP明文协议");
+                    return true;
+                }
+                if protocol == "tls" {
+                    debug!("🔍 协议检测中间件检测到TLS，继续检查ALPN");
+                    // 继续后续检查ALPN结果
+                }
+            }
+        }
+        
         // 方法1：检查ALPN协商结果 - 最可靠的方式（仅用于HTTPS）
         if let Some(alpn_result) = context.custom_data.get("alpn_protocol") {
             if let Some(protocol) = alpn_result.as_str() {
@@ -125,16 +141,17 @@ impl Http1StreamMiddleware {
             }
         }
         
-        // 方法5：检查普通HTTP端口（新增）
+        // 方法5：检查普通HTTP端口
         // 如果没有TLS流但是HTTP端口，推断为普通HTTP/1.1
         if matches!(context.target_port, 80 | 8080 | 8000 | 3000) && !context.connection.has_tls_streams() {
             debug!("🔍 检测到普通HTTP端口: {}", context.target_port);
             return true;
         }
         
-        // 方法6：如果既没有明确的协议信息，也没有TLS流，但有TCP流，可能是普通HTTP
+        // 方法6：最后的peek检测
+        // 如果既没有明确的协议信息，也没有TLS流，但有TCP流，尝试peek检测HTTP特征
         if !context.connection.has_tls_streams() && context.connection.stream.is_some() {
-            debug!("🔍 检测到TCP流但无TLS，可能是普通HTTP/1.1");
+            debug!("🔍 检测到TCP流但无TLS，尝试peek检测HTTP/1.1特征");
             // 可以尝试peek一些数据来检测HTTP请求特征
             if let Some(ref stream) = context.connection.stream {
                 if let Ok(is_http) = self.peek_http_request(stream).await {
@@ -509,15 +526,20 @@ impl Middleware for Http1StreamMiddleware {
         // 更新连接统计
         self.update_connection_stats().await;
         
-        // 检查是否有客户端TLS流可用（应该由TLS中间件提供）
-        if !context.connection.has_tls_streams() {
-            debug!("⚠️ 没有可用的TLS流，跳过HTTP/1.1处理");
+        // 检查连接类型：HTTPS(有TLS流) 还是 HTTP明文(有TCP流)
+        let has_tls = context.connection.has_tls_streams();
+        let has_tcp = context.connection.stream.is_some();
+        
+        if has_tls {
+            debug!("🔗 检测到TLS流，开始HTTPS/1.1请求解析: {}", context.id);
+        } else if has_tcp {
+            debug!("🔗 检测到TCP流，开始HTTP/1.1请求解析: {}", context.id);
+        } else {
+            warn!("⚠️ 没有可用的TLS流或TCP流，跳过HTTP/1.1处理");
             return Ok(MiddlewareResult::Continue);
         }
         
-        debug!("🔗 检测到TLS流，开始HTTP/1.1请求解析: {}", context.id);
-        
-        // 从TLS流读取并解析HTTP/1.1请求
+        // 读取并解析HTTP/1.1请求（支持TLS和TCP）
         match self.read_http1_request(context).await {
             Ok(http_request) => {
                 debug!("✅ HTTP/1.1请求解析成功: {} {}", http_request.method, http_request.url);
@@ -694,5 +716,49 @@ mod tests {
         assert_eq!(updated_stats.failed_requests, 1);
         
         println!("✅ 统计跟踪测试通过");
+    }
+    
+    #[tokio::test]
+    async fn test_http_cleartext_protocol_detection() {
+        let middleware = Http1StreamMiddleware::new();
+        
+        // 测试协议检测中间件设置的HTTP明文协议标记
+        let connection = Connection::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80)
+        );
+        let mut context = ConnectionContext::new(connection, "example.com".to_string(), 80);
+        
+        // 模拟协议检测中间件的结果
+        context.custom_data.insert(
+            "detected_protocol".to_string(),
+            serde_json::json!("httpcleartext")
+        );
+        
+        assert!(middleware.is_http1_protocol(&context).await);
+        
+        // 测试TLS协议标记
+        let mut context_tls = context.clone();
+        context_tls.custom_data.insert(
+            "detected_protocol".to_string(),
+            serde_json::json!("tls")
+        );
+        context_tls.custom_data.insert(
+            "alpn_protocol".to_string(),
+            serde_json::json!("http/1.1")
+        );
+        
+        assert!(middleware.is_http1_protocol(&context_tls).await);
+        
+        // 测试非HTTP协议
+        let mut context_other = context.clone();
+        context_other.custom_data.insert(
+            "detected_protocol".to_string(),
+            serde_json::json!("ssh")
+        );
+        
+        assert!(!middleware.is_http1_protocol(&context_other).await);
+        
+        println!("✅ HTTP明文协议检测测试通过");
     }
 }
