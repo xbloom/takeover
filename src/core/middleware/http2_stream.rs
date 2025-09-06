@@ -80,7 +80,7 @@ pub struct Http2Stats {
 #[derive(Debug, Clone)]
 pub struct StreamContext {
     /// 连接ID
-    pub connection_id: uuid::Uuid,
+    pub connection_id: String,
     /// 流ID (HTTP/2)
     pub stream_id: Option<u32>,
     /// 协议版本
@@ -111,7 +111,7 @@ impl Http2StreamMiddleware {
     /// 处理HTTPS + HTTP/2连接 - 现代化实现
     /// 
     /// 现在使用具体的rustls-tokio类型，完全兼容tokio::io traits
-    #[instrument(skip(client_tls_stream, connection_context, core, stats))]
+    #[instrument(skip(client_tls_stream, connection_context, core, stats), fields(connection_id = %connection_context.id))]
     pub async fn handle_https_connection(
         config: Http2Config,
         client_tls_stream: InboundTlsStream<TcpStream>,
@@ -119,7 +119,7 @@ impl Http2StreamMiddleware {
         core: Arc<crate::core::AppCore>,
         stats: Arc<RwLock<Http2Stats>>,
     ) -> Result<(), TakeoverError> {
-        let connection_id = connection_context.id;
+        let connection_id = connection_context.id.clone();
         
         // 更新连接统计
         {
@@ -174,7 +174,7 @@ impl Http2StreamMiddleware {
     }
     
     /// 处理单个HTTP/2流 - 静态方法
-    #[instrument(skip(req, core, stats))]
+    #[instrument(skip(req, core, stats), fields(connection_id = %connection_context.id))]
     async fn handle_http2_stream_static(
         req: Request<Incoming>,
         connection_context: ConnectionContext,
@@ -298,14 +298,14 @@ impl Http2StreamMiddleware {
     /// 
     /// 这是复杂Pipeline的核心：父Pipeline在这里进入长期监听状态，
     /// 为每个HTTP/2流动态spawn子Pipeline
-    #[instrument(skip(self, tls_stream, parent_context, core))]
+    #[instrument(skip(self, tls_stream, parent_context, core), fields(connection_id = %parent_context.id))]
     async fn start_http2_connection(
         &self,
         tls_stream: InboundTlsStream<TcpStream>,
         parent_context: ConnectionContext,
         core: &crate::core::AppCore,
     ) -> Result<(), TakeoverError> {
-        let connection_id = parent_context.id;
+        let connection_id = parent_context.id.clone();
         debug!("🚀 启动HTTP/2连接: {}", connection_id);
         
         // 更新连接统计
@@ -545,7 +545,7 @@ impl Http2StreamMiddleware {
             }
             
             // 确保有必要的头部
-            builder = builder.header("server", "takeover-proxy/1.0");
+            // builder = builder.header("server", "takeover-proxy/1.0");
             
             let hyper_response = builder
                 .body(Full::new(Bytes::from(response.body)))
@@ -647,13 +647,13 @@ impl Middleware for Http2StreamMiddleware {
         "http2_stream"
     }
     
-    #[instrument(skip(self, context, _core))]
+    #[instrument(skip(self, context, _core), fields(connection_id = %context.id))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
         _core: &crate::core::AppCore,
     ) -> Result<MiddlewareResult, TakeoverError> {
-        debug!("HTTP/2 stream middleware processing connection {}", context.id);
+        debug!("HTTP/2中间件开始处理");
         
         // 🔍 第一步：检查是否为HTTP/2协议
         if !self.is_http2_protocol(context).await {
@@ -744,7 +744,7 @@ mod tests {
     #[test]
     fn test_stream_context_creation() {
         let context = StreamContext {
-            connection_id: uuid::Uuid::new_v4(),
+            connection_id: crate::utils::generate_short_connection_id(),
             stream_id: Some(1),
             version: Version::HTTP_2,
             metadata: HashMap::new(),

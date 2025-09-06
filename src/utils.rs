@@ -1,6 +1,8 @@
 use anyhow::Result;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use sqids::Sqids;
+use std::sync::OnceLock;
 
 /// Parse a proxy URL into components
 pub fn parse_proxy_url(url: &str) -> Result<(String, String, u16, Option<(String, String)>)> {
@@ -121,14 +123,15 @@ pub fn request_privilege_escalation() -> Result<bool> {
     }
 }
 
-/// Execute a command with administrator privileges using sudo (after initial AppleScript verification)
+/// Execute a command with administrator privileges using sudo
 pub fn execute_admin_command(command: &str, args: &[&str]) -> Result<std::process::Output> {
     #[cfg(target_os = "macos")]
     {
         use std::process::Command;
         
-        // Use sudo with cached credentials (no password prompt after AppleScript verification)
+        // Use sudo with cached credentials
         let mut cmd = Command::new("sudo");
+        cmd.arg("-n");
         cmd.arg(command);
         for arg in args {
             cmd.arg(arg);
@@ -247,4 +250,46 @@ pub fn get_default_interface() -> Result<String> {
     {
         Err(anyhow::anyhow!("Interface detection not implemented for this platform"))
     }
+}
+
+// ========================================
+// 短ID生成器 - 使用Sqids
+// ========================================
+
+// 全局Sqids实例，用于生成短连接ID
+static SQIDS_INSTANCE: OnceLock<Sqids> = OnceLock::new();
+
+/// 获取或初始化Sqids实例
+fn get_sqids() -> &'static Sqids {
+    SQIDS_INSTANCE.get_or_init(|| {
+        // 配置Sqids：8-10字符长度，避免不良词汇
+        Sqids::builder()
+            .alphabet("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".chars().collect())
+            .min_length(8)  // 最少8字符
+            .build()
+            .expect("Failed to create Sqids instance")
+    })
+}
+
+/// 生成短连接ID
+/// 
+/// 使用Sqids从当前时间戳和随机数生成短而美观的ID
+/// 生成的ID格式类似: `86Rf07xd4z`, `K5Mn3Pq8vR`
+pub fn generate_short_connection_id() -> String {
+    let sqids = get_sqids();
+    
+    // 使用当前时间的纳秒数和随机数确保唯一性
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    
+    let random_part = fastrand::u64(1..1000000);
+    
+    // 编码生成短ID
+    sqids.encode(&[now_ns % 1000000, random_part])
+        .unwrap_or_else(|_| {
+            // 降级方案：如果Sqids失败，使用简单的十六进制
+            format!("{:08X}", fastrand::u32(..))
+        })
 }

@@ -306,12 +306,12 @@ async fn test_adapter_statistics() -> Result<()> {
 // ================================
 
 #[tokio::test]
-async fn test_outbound_config_integration() -> Result<()> {
+async fn test_outbound_integration() -> Result<()> {
     println!("🧪 测试出站配置集成");
     
     // 创建包含出站配置的完整应用配置
     let mut app_config = AppConfig::default();
-    app_config.outbound_config = OutboundConfig {
+    app_config.outbound = OutboundConfig {
         timeout: Duration::from_secs(10),
         read_timeout: Duration::from_secs(30),
         write_timeout: Duration::from_secs(30),
@@ -320,15 +320,15 @@ async fn test_outbound_config_integration() -> Result<()> {
     };
     
     // 验证配置
-    assert_eq!(app_config.outbound_config.timeout, Duration::from_secs(10));
-    assert_eq!(app_config.outbound_config.read_timeout, Duration::from_secs(30));
-    assert_eq!(app_config.outbound_config.retry_count, 3);
+    assert_eq!(app_config.outbound.timeout, Duration::from_secs(10));
+    assert_eq!(app_config.outbound.read_timeout, Duration::from_secs(30));
+    assert_eq!(app_config.outbound.retry_count, 3);
     
     println!("✅ Direct出站配置验证通过");
     
     // 测试SOCKS5配置
     let mut socks5_config = AppConfig::default();
-    socks5_config.outbound_config = OutboundConfig {
+    socks5_config.outbound = OutboundConfig {
         timeout: Duration::from_secs(15),
         read_timeout: Duration::from_secs(60),
         write_timeout: Duration::from_secs(60),
@@ -336,9 +336,9 @@ async fn test_outbound_config_integration() -> Result<()> {
         retry_delay: Duration::from_millis(1000),
     };
     
-    assert_eq!(socks5_config.outbound_config.timeout, Duration::from_secs(15));
-    assert_eq!(socks5_config.outbound_config.read_timeout, Duration::from_secs(60));
-    assert_eq!(socks5_config.outbound_config.retry_count, 2);
+    assert_eq!(socks5_config.outbound.timeout, Duration::from_secs(15));
+    assert_eq!(socks5_config.outbound.read_timeout, Duration::from_secs(60));
+    assert_eq!(socks5_config.outbound.retry_count, 2);
     
     println!("✅ SOCKS5出站配置验证通过");
     
@@ -356,7 +356,7 @@ async fn test_full_integration_with_previous_levels() -> Result<()> {
     // Level 1: 配置系统集成
     println!("🔗 集成Level 1: 配置系统");
     let config = AppConfig::default();
-    assert!(config.outbound_config.timeout > Duration::ZERO);
+    assert!(config.outbound.timeout > Duration::ZERO);
     println!("✅ 配置系统集成正常");
     
     // Level 2: 核心模型集成

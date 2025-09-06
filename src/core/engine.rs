@@ -89,13 +89,13 @@ impl Pipeline {
     }
     
     /// 执行管道
-    #[instrument(skip(self, context, core))]
+    #[instrument(skip(self, context, core), fields(connection_id = %context.id))]
     pub async fn process(
         &self,
         context: &mut ConnectionContext,
         core: &crate::core::AppCore,
     ) -> Result<MiddlewareResult, TakeoverError> {
-        debug!("Starting pipeline execution for connection {}", context.id);
+        debug!("开始Pipeline执行");
         
         for middleware in &self.middlewares {
             if !middleware.enabled() {
@@ -298,7 +298,9 @@ impl ProcessingEngine {
             Arc::new(middleware::protocol_detection::ProtocolDetectionMiddleware::new()),
             
             // 🔐 TLS中间件 (优先级10) - 处理HTTPS拦截和ALPN协商
-            Arc::new(middleware::tls::TlsMiddleware::new()),
+            Arc::new(middleware::tls::TlsMiddleware::with_config(
+                middleware::tls::TlsMiddlewareConfig::default()
+            )),
             
             // 🌐 HTTP/2流中间件 (优先级15) - HTTP/2协议完整生命周期
             Arc::new(middleware::http2_stream::Http2StreamMiddleware::new()),

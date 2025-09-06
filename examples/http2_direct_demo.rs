@@ -13,13 +13,13 @@
 
 use std::sync::Arc;
 use anyhow::Result;
-use tracing::{info, level_filters::LevelFilter, debug};
+use takeover::TlsConfig;
+use tracing::{info, level_filters::LevelFilter, debug, warn, error};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tokio::signal;
 
 // 导入核心组件
 use takeover::core::{AppCore, AppConfig, GeneralConfig, InboundConfig, OutboundConfig, ScriptConfig};
-use takeover::core::middleware::{Http2StreamMiddleware, ForwardingMiddleware};
-use takeover::core::engine::ProcessingEngine;
 
 // 导入适配器
 use takeover::adapters::{PfInboundAdapter, DirectOutboundAdapter};
@@ -40,22 +40,74 @@ async fn main() -> Result<()> {
     
     info!("✅ Demo应用构建完成");
     info!("📋 配置说明:");
-    info!("   - 监听端口: 8080");
-    info!("   - 拦截端口: [443, 8443]");
+    info!("   - 监听端口: 配置为0时自动分配随机端口，非0时使用指定端口");
+    info!("   - 拦截端口: [443, 8443, 9443]");
     info!("   - 架构: HTTP/2 Stream → 转发中间件 → Direct适配器");
+    info!("   - 用户切换: 启动时切换到_takeover_proxy用户防循环");
+    info!("   - 测试命令: curl https://httpbin.org/ip -v (透明拦截)");
     info!("   - 测试命令: curl --connect-to httpbin.org:443:127.0.0.1:8080 https://httpbin.org/ip -v");
-    
+
     // 启动应用程序
     info!("🎯 启动透明代理服务...");
-    app.run().await?;
+    info!("按 Ctrl+C 停止透明代理...");
+    
+    // 使用 tokio::select! 来并发运行服务器和等待信号
+    let result = tokio::select! {
+        // 运行透明代理服务器（这会一直运行直到出错或被取消）
+        app_result = app.run() => {
+            match app_result {
+                Ok(_) => {
+                    info!("🎉 透明代理服务器正常退出");
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("❌ 透明代理服务器运行失败: {}", e);
+                    Err(e.into())
+                }
+            }
+        }
+        
+        // 等待 Ctrl+C 信号
+        _ = signal::ctrl_c() => {
+            info!("🛑 收到 Ctrl+C 信号，正在关闭...");
+
+            // 请求停止服务器
+            info!("正在停止透明代理服务器...");
+            app.request_stop().await;
+            
+            // 等待应用程序优雅关闭
+            info!("正在等待优雅关闭...");
+            if let Err(e) = app.shutdown().await {
+                error!("关闭透明代理服务器时出错: {}", e);
+                warn!("可能需要手动清理pfctl规则");
+                warn!("可以运行: sudo pfctl -d 来禁用pfctl");
+                Err(e.into())
+            } else {
+                info!("✅ 透明代理系统已完全停止，pfctl规则已清理");
+                Ok(())
+            }
+        }
+    };
+    
+    // 处理结果
+    match result {
+        Ok(_) => {
+            info!("🎉 程序正常退出");
+        }
+        Err(e) => {
+            error!("💥 程序异常退出: {}", e);
+            return Err(e);
+        }
+    }
     
     Ok(())
 }
 
 /// 初始化日志系统
 fn init_logging() -> Result<()> {
-    let env_filter = EnvFilter::from_default_env()
-        .add_directive(LevelFilter::INFO.into());
+    let env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
     
     tracing_subscriber::registry()
         .with(fmt::layer().with_target(true).with_thread_ids(false))
@@ -72,62 +124,50 @@ fn create_demo_config() -> AppConfig {
         version: "1.0.0".to_string(),
         
         // 通用配置
-        general_config: GeneralConfig {
+        general: GeneralConfig {
             max_connections: 100,
-            connection_timeout: std::time::Duration::from_secs(300),
+            connection_timeout: std::time::Duration::from_secs(30),
             log_level: "debug".to_string(),
         },
         
         // 入站配置 - pfctl透明代理
-        inbound_config: InboundConfig {
+        inbound: InboundConfig {
             listen_address: "127.0.0.1".to_string(),
-            listen_port: 8080,
+            listen_port: 0, // 🎯 端口0 = 自动分配随机端口，非0 = 使用指定端口
             max_connections: 100,
             buffer_size: 8192,
             timeout: std::time::Duration::from_secs(60),
-            intercepted_ports: vec![], // 拦截HTTPS端口
-            bypass_user: Some("nobody".to_string()),
+            intercepted_ports: vec![80,443], // 拦截HTTPS端口
+            bypass_user: Some("_takeover_proxy".to_string()), // 使用正确的用户名
         },
         
-        // 出站配置 - 直连
-        outbound_config: OutboundConfig {
-            timeout: std::time::Duration::from_secs(10),
-            read_timeout: std::time::Duration::from_secs(30),
-            write_timeout: std::time::Duration::from_secs(10),
-            retry_count: 2,
+        // 出站配置 - 直连  
+        outbound: OutboundConfig {
+            timeout: std::time::Duration::from_secs(5),
+            read_timeout: std::time::Duration::from_secs(15),
+            write_timeout: std::time::Duration::from_secs(5),
+            retry_count: 1,
             retry_delay: std::time::Duration::from_millis(500),
+        },
+
+        tls: TlsConfig {
+            enabled: true,
+            interception_mode: "selective".to_string(),
+            intercept_domains: vec!["*.org".to_string(), "*.com".to_string()],
+            cert_store_path: None,
+            cert_cache_duration: 86400, // 24小时
+            max_concurrent_handshakes: 50,
+            auto_install_ca: true,
         },
         
         // 脚本配置 - 禁用
-        script_config: ScriptConfig {
-            enabled: false,
-            script_dir: "./scripts".into(),
-            timeout: std::time::Duration::from_secs(30),
-            max_concurrent: 10,
-        },
-        
-        // 补充缺失的字段
-        general: GeneralConfig {
-            max_connections: 100,
-            connection_timeout: std::time::Duration::from_secs(300),
-            log_level: "debug".to_string(),
-        },
-        inbound: InboundConfig {
-            listen_address: "127.0.0.1".to_string(),
-            listen_port: 8080,
-            max_connections: 100,
-            buffer_size: 8192,
-            timeout: std::time::Duration::from_secs(60),
-            intercepted_ports: vec![443, 8443, 9443],
-            bypass_user: Some("nobody".to_string()),
-        },
         script: ScriptConfig {
             enabled: false,
             script_dir: "./scripts".into(),
             timeout: std::time::Duration::from_secs(30),
             max_concurrent: 10,
         },
-    }
+    } 
 }
 
 /// 构建Demo应用程序
@@ -141,13 +181,10 @@ async fn build_demo_app(config: AppConfig) -> Result<AppCore> {
     let outbound_adapter = create_outbound_adapter(&config).await?;
     let control_adapter = create_control_adapter().await?;
     
-    // 2. 注意：处理引擎会在AppCore内部自动创建和配置
-    // let engine = create_processing_engine().await?;
-    
-    // 3. 创建简单的事件端口
+    // 2. 创建简单的事件端口
     let event_port = Arc::new(SimpleEventPort::new());
     
-    // 4. 组装应用核心
+    // 3. 组装应用核心
     let app_core = AppCore::new(
         (*config).clone(),
         inbound_adapter,
@@ -155,9 +192,6 @@ async fn build_demo_app(config: AppConfig) -> Result<AppCore> {
         control_adapter,
         event_port,
     );
-    
-    // 注意: 这个demo版本使用默认的处理引擎
-    // 真正的处理引擎设置需要在AppCore内部通过build_pipeline完成
     
     info!("✅ Demo应用程序构建完成");
     Ok(app_core)
@@ -197,28 +231,6 @@ async fn create_control_adapter() -> Result<Arc<dyn takeover::core::ports::Contr
     Ok(Arc::new(adapter))
 }
 
-/// 创建处理引擎
-async fn create_processing_engine() -> Result<Arc<ProcessingEngine>> {
-    info!("🔧 创建处理引擎和中间件管道");
-    
-    let mut engine = ProcessingEngine::new();
-    
-    // 添加关键中间件（简化版本）
-    
-    // 1. HTTP/2流中间件 (优先级15)
-    let http2_middleware = Arc::new(Http2StreamMiddleware::new());
-    engine.add_middleware(http2_middleware);
-    info!("   ✅ 添加HTTP/2流中间件 (优先级: 15)");
-    
-    // 2. 转发中间件 (优先级60)
-    let forwarding_middleware = Arc::new(ForwardingMiddleware::new());
-    engine.add_middleware(forwarding_middleware);
-    info!("   ✅ 添加转发中间件 (优先级: 60)");
-    
-    info!("✅ 处理引擎创建完成 (包含2个核心中间件)");
-    Ok(Arc::new(engine))
-}
-
 /// 简单的事件端口实现
 struct SimpleEventPort;
 
@@ -237,10 +249,10 @@ impl takeover::core::ports::EventPort for SimpleEventPort {
     async fn publish(&self, event: takeover::core::ports::DomainEvent) -> Result<(), takeover::core::ports::AppError> {
         // 简单的日志输出
         match event {
-            takeover::core::ports::DomainEvent::ConnectionNew { id, addr, .. } => {
+            takeover::core::ports::DomainEvent::ConnectionNew { id: _, addr: _, .. } => {
                 // info!("📡 新连接: {} from {}", id, addr);
             }
-            takeover::core::ports::DomainEvent::ConnectionClosed { id, duration, bytes_transferred } => {
+            takeover::core::ports::DomainEvent::ConnectionClosed { id: _, duration: _, bytes_transferred: _ } => {
                 // info!("📡 连接关闭: {} (持续: {:.2}s, 传输: {}字节)", id, duration.as_secs_f64(), bytes_transferred);
             }
             takeover::core::ports::DomainEvent::RequestProcessed { conn_id, request_id, duration } => {

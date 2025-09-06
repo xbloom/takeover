@@ -383,7 +383,7 @@ impl StateManager {
                     .filter_map(|(id, state)| {
                         if let Ok(duration) = now.duration_since(state.last_activity) {
                             if duration > config.connection_timeout {
-                                Some(*id)
+                                Some(id.clone())
                             } else {
                                 None
                             }
@@ -485,7 +485,7 @@ impl StateManager {
         debug!("Creating connection state for {}", connection_id);
         
         let state = ConnectionState {
-            id: connection_id,
+            id: connection_id.clone(),
             source_addr,
             target_addr,
             target_host,
@@ -510,13 +510,13 @@ impl StateManager {
             if let Some(oldest_id) = connections
                 .iter()
                 .min_by_key(|(_, state)| state.last_activity)
-                .map(|(id, _)| *id) {
+                .map(|(id, _)| id.clone()) {
                 connections.remove(&oldest_id);
                 warn!("Removed oldest connection {} due to limit", oldest_id);
             }
         }
         
-        connections.insert(connection_id, state);
+        connections.insert(connection_id.clone(), state);
         drop(connections);
         
         // 更新统计
@@ -530,13 +530,13 @@ impl StateManager {
         // 发送事件
         self.emit_event(StateEvent {
             event_type: StateEventType::ConnectionCreated,
-            connection_id: Some(connection_id),
+            connection_id: Some(connection_id.clone()),
             session_id: None,
             data: HashMap::new(),
             timestamp: SystemTime::now(),
         }).await;
         
-        info!("✅ Connection state created for {}", connection_id);
+        info!("✅ Connection state created for {}", &connection_id);
         Ok(())
     }
     
@@ -555,13 +555,13 @@ impl StateManager {
             // 发送更新事件
             self.emit_event(StateEvent {
                 event_type: StateEventType::ConnectionUpdated,
-                connection_id: Some(connection_id),
+                connection_id: Some(connection_id.clone()),
                 session_id: None,
                 data: HashMap::new(),
                 timestamp: SystemTime::now(),
             }).await;
             
-            debug!("Updated connection state for {}", connection_id);
+            debug!("Updated connection state for {}", &connection_id);
             Ok(())
         } else {
             Err(AppError::Config(format!("Connection {} not found", connection_id)))
@@ -594,13 +594,13 @@ impl StateManager {
             // 发送关闭事件
             self.emit_event(StateEvent {
                 event_type: StateEventType::ConnectionClosed,
-                connection_id: Some(connection_id),
+                connection_id: Some(connection_id.clone()),
                 session_id: None,
                 data: HashMap::new(),
                 timestamp: SystemTime::now(),
             }).await;
             
-            info!("✅ Connection state closed for {}", connection_id);
+            info!("✅ Connection state closed for {}", &connection_id);
             Ok(())
         } else {
             Err(AppError::Config(format!("Connection {} not found", connection_id)))
@@ -959,13 +959,14 @@ mod tests {
         let manager = StateManager::new(StateManagerConfig::default());
         manager.start().await.unwrap();
         
-        let conn_id = Uuid::new_v4();
+        let conn_id = crate::utils::generate_short_connection_id()
+        ;
         let source_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
         let target_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80);
         
         // 创建连接状态
         manager.create_connection_state(
-            conn_id,
+            conn_id.clone(),
             source_addr,
             target_addr,
             "example.com".to_string(),
@@ -973,20 +974,20 @@ mod tests {
         ).await.unwrap();
         
         // 获取连接状态
-        let state = manager.get_connection_state(conn_id).await;
+        let state = manager.get_connection_state(conn_id.clone()).await;
         assert!(state.is_some());
         assert_eq!(state.unwrap().target_host, "example.com");
         
         // 更新连接状态
-        manager.update_connection_state(conn_id, |state| {
+        manager.update_connection_state(conn_id.clone(), |state| {
             state.processing_state = ProcessingState::Processing;
         }).await.unwrap();
         
         // 关闭连接状态
-        manager.close_connection_state(conn_id).await.unwrap();
+        manager.close_connection_state(conn_id.clone()).await.unwrap();
         
         // 连接应该被移除
-        let state = manager.get_connection_state(conn_id).await;
+        let state = manager.get_connection_state(conn_id.clone()).await;
         assert!(state.is_none());
         
         manager.stop().await.unwrap();
@@ -1080,7 +1081,7 @@ mod tests {
         assert_eq!(stats.total_connections, 0);
         
         // 创建一个连接
-        let conn_id = Uuid::new_v4();
+        let conn_id = crate::utils::generate_short_connection_id();
         let source_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
         let target_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80);
         

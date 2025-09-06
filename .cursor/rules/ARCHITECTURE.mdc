@@ -8,8 +8,12 @@ alwaysApply: true
 
 本文档描述了Takeover透明代理系统的六边形架构设计，包括当前实现状态、待完成任务和详细的实现指导。
 
-**最后更新**: 2024年12月
-**架构版本**: v2.0 (六边形架构重构版本)
+**最后更新**: 2024年12月  
+**架构版本**: v2.1 (四分支协议处理完整版本)
+
+### 版本更新记录
+- **v2.1** (2024-12): 修复普通HTTP处理分支，完善协议检测集成，HTTP/1.1中间件双流支持
+- **v2.0** (2024-12): 六边形架构重构版本，四分支协议处理架构
 
 ## 🎯 架构目标
 
@@ -145,7 +149,7 @@ src/
 | 50 | **HttpModificationMiddleware** | HTTP请求/响应修改 | `HttpRequest` | 修改后请求 | 🟡 占位符 |
 | 60 | **ForwardingMiddleware** | 请求转发、出站连接 | `HttpRequest` | `HttpResponse` | ✅ 已实现 |
 | 70 | **ResponseMergeMiddleware** | 响应合并、后处理 | `HttpResponse` | 最终响应 | 🟡 占位符 |
-| 75 | **ResponseWriteBackMiddleware** | 统一响应写回、协议输出 | `HttpResponse` | 写回客户端 | 🟡 待实现 |
+| 75 | **ResponseWriteBackMiddleware** | 统一响应写回、协议输出 | `HttpResponse` | 写回客户端 | ✅ 已实现 |
 
 ### 关键架构原则
 
@@ -191,14 +195,16 @@ src/
 - **职责边界**: HTTP/1.1协议解析，生成标准请求对象
 - **输入**: `TlsStream`(HTTPS) 或 `TcpStream`(HTTP)
 - **处理模式**:
-  1. **协议验证**: 检查ALPN=http/1.1 或明文HTTP特征
-  2. **请求解析**: 读取HTTP请求行、头部、body
-  3. **对象生成**: 创建标准`HttpRequest`对象
-  4. **流保持**: 保持流状态，供后续响应写回使用
+  1. **协议验证**: 优先检查协议检测中间件结果(`httpcleartext`/`tls`)
+  2. **双模式支持**: 自动识别TLS流(HTTPS)或TCP流(HTTP)
+  3. **请求解析**: 读取HTTP请求行、头部、body
+  4. **对象生成**: 创建标准`HttpRequest`对象
+  5. **流保持**: 保持流状态，供后续响应写回使用
 - **架构特性**:
   - **标准Pipeline**: Continue到业务中间件(30-70)
+  - **双流支持**: 同时支持TLS流和TCP流处理
+  - **协议检测集成**: 优先使用协议检测中间件的结果
   - **流状态保持**: 不接管连接，保持在context中
-  - **协议简单**: 一对一请求响应模式
 - **实现策略**: 手动解析HTTP/1.1协议，输出标准对象
 
 #### 🎯 **业务中间件 (优先级30-70)**
@@ -379,16 +385,54 @@ impl Http2StreamMiddleware {
 // HTTP/1.1中间件 (优先级16) - 解析后继续Pipeline
 impl Http1StreamMiddleware {
     async fn process(&self, context: &mut ConnectionContext, core: &AppCore) -> Result<MiddlewareResult> {
+        // 优先检查协议检测中间件的结果
         if !self.is_http1_protocol(context).await {
             return Ok(MiddlewareResult::Continue);
         }
         
-        // 解析HTTP/1.1请求（支持TLS和明文）
+        // 检查连接类型：HTTPS(有TLS流) 还是 HTTP明文(有TCP流)
+        let has_tls = context.connection.has_tls_streams();
+        let has_tcp = context.connection.stream.is_some();
+        
+        if has_tls {
+            debug!("🔗 检测到TLS流，开始HTTPS/1.1请求解析");
+        } else if has_tcp {
+            debug!("🔗 检测到TCP流，开始HTTP/1.1请求解析");
+        } else {
+            return Ok(MiddlewareResult::Continue);
+        }
+        
+        // 解析HTTP/1.1请求（自动支持TLS和TCP流）
         let http_request = self.read_http1_request(context).await?;
         context.request = Some(http_request);
         
         // 继续业务Pipeline处理
         Ok(MiddlewareResult::Continue)
+    }
+    
+    // 协议检测逻辑（优先级顺序）
+    async fn is_http1_protocol(&self, context: &ConnectionContext) -> bool {
+        // 方法0：检查协议检测中间件的结果 - 最优先和最可靠
+        if let Some(detected_protocol) = context.custom_data.get("detected_protocol") {
+            if let Some(protocol) = detected_protocol.as_str() {
+                if protocol == "httpcleartext" {
+                    return true; // HTTP明文协议
+                }
+                if protocol == "tls" {
+                    // TLS协议，继续检查ALPN结果
+                }
+            }
+        }
+        
+        // 方法1：检查ALPN协商结果（仅用于HTTPS）
+        if let Some(alpn_result) = context.custom_data.get("alpn_protocol") {
+            if let Some(protocol) = alpn_result.as_str() {
+                return protocol == "http/1.1";
+            }
+        }
+        
+        // 其他检测方法...
+        false
     }
 }
 ```
@@ -445,12 +489,15 @@ impl ResponseWriteBackMiddleware {
 2. **分支处理**: 不同协议采用最适合的处理策略
 3. **职责单一**: 每个中间件专注单一职责，保持架构清晰
 4. **最小侵入**: 保持现有业务逻辑不变，仅补充缺失组件
+5. **协议检测集成**: HTTP/1.1中间件优先使用协议检测结果，避免重复检测
+6. **双流支持**: HTTP/1.1中间件同时支持TLS流(HTTPS)和TCP流(HTTP)处理
 
 #### **协议处理策略**
 1. **Copy Pipe透传**: 非HTTP协议直接双向转发，零解析开销
 2. **HTTP/2复杂协议**: 使用hyper完整接管，处理多路复用复杂性
 3. **HTTP/1.1简单协议**: 手动解析 + 标准Pipeline + 统一写回
 4. **TLS拦截**: 按需拦截，支持ALPN协商确定应用层协议
+5. **HTTP明文处理**: 直接从TCP流解析HTTP/1.1，无需TLS拦截
 
 #### **性能优化策略**
 1. **零拷贝**: 关键路径避免不必要的内存拷贝

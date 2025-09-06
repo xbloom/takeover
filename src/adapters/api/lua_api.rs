@@ -541,9 +541,9 @@ mod tests {
     async fn test_connection_cache() {
         let adapter = LuaApiAdapter::new(LuaApiConfig::default()).unwrap();
         
-        let conn_id = uuid::Uuid::new_v4();
+        let conn_id = crate::utils::generate_short_connection_id();
         let conn_info = ConnectionInfo {
-            id: conn_id,
+            id: conn_id.clone(),
             source_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
             target_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80),
             protocol: "HTTP".to_string(),
@@ -552,12 +552,12 @@ mod tests {
         };
         
         // 缓存连接信息
-        adapter.cache_connection_info(conn_id, conn_info.clone()).await;
+        adapter.cache_connection_info(conn_id.clone(), conn_info.clone()).await;
         
         // 查询连接信息
-        let retrieved = adapter.get_connection_info(conn_id).await.unwrap();
+        let retrieved = adapter.get_connection_info(conn_id.clone()).await.unwrap();
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap().id, conn_id);
+        assert_eq!(retrieved.unwrap().id, conn_id.clone()); 
     }
     
     #[tokio::test]

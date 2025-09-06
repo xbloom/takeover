@@ -49,7 +49,7 @@ async fn demo_connection_creation() -> Result<(), Box<dyn std::error::Error>> {
     // 验证
     assert_eq!(connection.source_addr, source);
     assert_eq!(connection.original_dest, dest);
-    assert!(!connection.id.is_nil());
+    assert!(!connection.id.is_empty());
     assert_eq!(connection.metadata.protocol, "TCP");
     
     println!("   ✅ 连接创建功能正常");
@@ -230,26 +230,26 @@ async fn demo_app_config() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::default();
     
     println!("   ⚙️  入站配置:");
-    println!("      监听地址: {}", config.inbound_config.listen_address);
-    println!("      监听端口: {}", config.inbound_config.listen_port);
-    println!("      最大连接数: {}", config.inbound_config.max_connections);
-    println!("      缓冲区大小: {}", config.inbound_config.buffer_size);
+    println!("      监听地址: {}", config.inbound.listen_address);
+    println!("      监听端口: {}", config.inbound.listen_port);
+    println!("      最大连接数: {}", config.inbound.max_connections);
+    println!("      缓冲区大小: {}", config.inbound.buffer_size);
     
     println!("   ⚙️  出站配置:");
-    println!("      连接超时: {:?}", config.outbound_config.timeout);
-    println!("      读取超时: {:?}", config.outbound_config.read_timeout);
-    println!("      写入超时: {:?}", config.outbound_config.write_timeout);
-    println!("      重试次数: {:?}", config.outbound_config.retry_count);
-    println!("      重试延迟: {:?}", config.outbound_config.retry_delay);
+    println!("      连接超时: {:?}", config.outbound.timeout);
+    println!("      读取超时: {:?}", config.outbound.read_timeout);
+    println!("      写入超时: {:?}", config.outbound.write_timeout);
+    println!("      重试次数: {:?}", config.outbound.retry_count);
+    println!("      重试延迟: {:?}", config.outbound.retry_delay);
     
     println!("   ⚙️  通用配置:");
-    println!("      最大连接数: {}", config.general_config.max_connections);
-    println!("      日志级别: {:?}", config.general_config.log_level);
+    println!("      最大连接数: {}", config.general.max_connections);
+    println!("      日志级别: {:?}", config.general.log_level);
     
     // 验证默认配置合理性
-    assert!(config.inbound_config.listen_port > 0);
-    assert!(config.general_config.max_connections > 0);
-    assert!(!config.inbound_config.listen_address.is_empty());
+    assert!(config.inbound.listen_port > 0);
+    assert!(config.general.max_connections > 0);
+    assert!(!config.inbound.listen_address.is_empty());
     
     println!("   ✅ 应用配置功能正常");
     Ok(())

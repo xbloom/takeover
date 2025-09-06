@@ -467,7 +467,7 @@ impl ResponseMergeMiddleware {
         let task_id = Uuid::new_v4();
         let merge_task = MergeTask {
             id: task_id,
-            connection_id: context.id,
+            connection_id: context.id.clone(),
             primary_response: Some(primary_response.clone()),
             additional_responses: additional_sources,
             strategy: strategy.clone(),
@@ -489,11 +489,11 @@ impl ResponseMergeMiddleware {
         // 添加到活跃任务
         {
             let mut active_merges = self.active_merges.write().await;
-            active_merges.insert(context.id, merge_task.clone());
+            active_merges.insert(context.id.clone(), merge_task.clone());
         }
         
         // 执行合并
-        let result = self.perform_merge(context.id, merge_task).await;
+        let result = self.perform_merge(context.id.clone(), merge_task).await;
         
         // 移除活跃任务
         {

@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{warn, error, debug, instrument};
 use async_trait::async_trait;
 use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncBufReadExt, BufReader};
 
@@ -164,7 +164,7 @@ impl ForwardingMiddleware {
                     
                     // 记录字节传输
                     core.update_connection_bytes(
-                        context.id,
+                        context.id.clone(),
                         request.body.len() as u64,
                         response.body.len() as u64
                     ).await;
@@ -172,7 +172,7 @@ impl ForwardingMiddleware {
                     return Ok(response);
                 }
                 Err(e) => {
-                    warn!("⚠️ 转发尝试失败 (第{}次): {}", attempt + 1, e);
+                    debug!("⚠️ 转发尝试失败 (第{}次): {}", attempt + 1, e);
                     last_error = Some(e);
                 }
             }
@@ -183,7 +183,7 @@ impl ForwardingMiddleware {
             TakeoverError::Config("All forwarding attempts failed".to_string())
         );
         
-        error!("❌ 转发最终失败: {} {} - {}", request.method, request.url, error);
+        debug!("⚠️ 转发失败: {} {} - {}", request.method, request.url, error);
         
         // 更新失败统计
         {
@@ -368,7 +368,7 @@ impl ForwardingMiddleware {
         }
     }
     
-    /// 读取HTTP响应
+    /// 读取HTTP响应 - 完整的HTTP/1.1协议支持
     async fn read_http_response(
         &self,
         stream: &mut dyn crate::core::ports::NetworkStream,
@@ -384,8 +384,11 @@ impl ForwardingMiddleware {
         reader.read_line(&mut status_line).await
             .map_err(|e| TakeoverError::Config(format!("Failed to read status line: {}", e)))?;
         
+        let status_line = status_line.trim();
+        debug!("📥 收到HTTP状态行: {}", status_line);
+        
         // 解析状态行: HTTP/1.1 200 OK
-        let status_parts: Vec<&str> = status_line.trim().split_whitespace().collect();
+        let status_parts: Vec<&str> = status_line.split_whitespace().collect();
         if status_parts.len() >= 2 {
             status_code = status_parts[1].parse().unwrap_or(200);
             if status_parts.len() >= 3 {
@@ -393,8 +396,11 @@ impl ForwardingMiddleware {
             }
         }
         
-        // 读取头部
-        let mut content_length = 0;
+        // 读取头部并分析传输方式
+        let mut content_length: Option<usize> = None;
+        let mut is_chunked = false;
+        let mut connection_close = false;
+        
         loop {
             let mut header_line = String::new();
             reader.read_line(&mut header_line).await
@@ -409,23 +415,56 @@ impl ForwardingMiddleware {
                 let name = header_line[..colon_pos].trim().to_string();
                 let value = header_line[colon_pos + 1..].trim().to_string();
                 
-                if name.to_lowercase() == "content-length" {
-                    content_length = value.parse().unwrap_or(0);
+                // 分析关键头部
+                match name.to_lowercase().as_str() {
+                    "content-length" => {
+                        content_length = value.parse().ok();
+                        debug!("📏 Content-Length: {:?}", content_length);
+                    }
+                    "transfer-encoding" => {
+                        if value.to_lowercase().contains("chunked") {
+                            is_chunked = true;
+                            debug!("🔀 检测到Chunked编码");
+                        }
+                    }
+                    "connection" => {
+                        if value.to_lowercase().contains("close") {
+                            connection_close = true;
+                            debug!("🔌 连接将关闭");
+                        }
+                    }
+                    _ => {}
                 }
                 
                 headers.insert(name, value);
             }
         }
         
-        // 读取响应体
-        let mut body = Vec::new();
-        if content_length > 0 {
-            body.resize(content_length, 0);
-            reader.read_exact(&mut body).await
-                .map_err(|e| TakeoverError::Config(format!("Failed to read response body: {}", e)))?;
-        }
+        // 🎯 根据不同的传输方式读取响应体
+        let body = if is_chunked {
+            debug!("📦 读取Chunked响应体");
+            self.read_chunked_body(&mut reader).await?
+        } else if let Some(length) = content_length {
+            debug!("📏 读取Content-Length响应体: {}字节", length);
+            self.read_content_length_body(&mut reader, length).await?
+        } else if connection_close {
+            debug!("🔄 读取连接关闭式响应体");
+            self.read_until_close_body(&mut reader).await?
+        } else {
+            debug!("⚠️ 无法确定响应体长度，假设无体或尝试读取剩余数据");
+            // 尝试读取一些数据，如果有的话
+            match self.read_until_close_body(&mut reader).await {
+                Ok(data) => {
+                    if !data.is_empty() {
+                        debug!("📊 读取到意外响应体: {} 字节", data.len());
+                    }
+                    data
+                }
+                Err(_) => Vec::new() // 忽略错误，返回空体
+            }
+        };
         
-        debug!("读取到HTTP响应: {} {} ({}字节)", status_code, status_text, body.len());
+        debug!("✅ 读取到HTTP响应: {} {} ({}字节)", status_code, status_text, body.len());
         
         Ok(HttpResponse {
             id: Some(uuid::Uuid::new_v4()),
@@ -435,6 +474,125 @@ impl ForwardingMiddleware {
             body,
             sent_at: Some(std::time::SystemTime::now()),
         })
+    }
+    
+    /// 读取Chunked编码的响应体
+    async fn read_chunked_body(
+        &self, 
+        reader: &mut BufReader<&mut dyn crate::core::ports::NetworkStream>
+    ) -> Result<Vec<u8>, TakeoverError> {
+        let mut body = Vec::new();
+        
+        loop {
+            // 读取chunk大小行
+            let mut size_line = String::new();
+            reader.read_line(&mut size_line).await
+                .map_err(|e| TakeoverError::Config(format!("Failed to read chunk size: {}", e)))?;
+            
+            let size_line = size_line.trim();
+            if size_line.is_empty() {
+                break;
+            }
+            
+            // 解析chunk大小（16进制）
+            let chunk_size = if let Some(semicolon_pos) = size_line.find(';') {
+                // 忽略chunk扩展
+                &size_line[..semicolon_pos]
+            } else {
+                size_line
+            };
+            
+            let chunk_size = usize::from_str_radix(chunk_size, 16)
+                .map_err(|e| TakeoverError::Config(format!("Invalid chunk size: {} - {}", chunk_size, e)))?;
+            
+            debug!("📦 Chunk大小: {} 字节", chunk_size);
+            
+            if chunk_size == 0 {
+                // 最后一个chunk，读取trailer头部
+                self.read_trailer_headers(reader).await?;
+                break;
+            }
+            
+            // 读取chunk数据
+            let mut chunk_data = vec![0u8; chunk_size];
+            reader.read_exact(&mut chunk_data).await
+                .map_err(|e| TakeoverError::Config(format!("Failed to read chunk data: {}", e)))?;
+            
+            body.extend_from_slice(&chunk_data);
+            
+            // 读取chunk末尾的CRLF
+            let mut crlf = String::new();
+            reader.read_line(&mut crlf).await
+                .map_err(|e| TakeoverError::Config(format!("Failed to read chunk CRLF: {}", e)))?;
+        }
+        
+        debug!("📦 Chunked响应体读取完成: {} 字节", body.len());
+        Ok(body)
+    }
+    
+    /// 读取trailer头部（chunked编码末尾）
+    async fn read_trailer_headers(
+        &self, 
+        reader: &mut BufReader<&mut dyn crate::core::ports::NetworkStream>
+    ) -> Result<(), TakeoverError> {
+        loop {
+            let mut trailer_line = String::new();
+            reader.read_line(&mut trailer_line).await
+                .map_err(|e| TakeoverError::Config(format!("Failed to read trailer: {}", e)))?;
+            
+            let trailer_line = trailer_line.trim();
+            if trailer_line.is_empty() {
+                break; // trailer结束
+            }
+            
+            debug!("📝 Trailer头部: {}", trailer_line);
+        }
+        
+        Ok(())
+    }
+    
+    /// 读取指定Content-Length的响应体
+    async fn read_content_length_body(
+        &self, 
+        reader: &mut BufReader<&mut dyn crate::core::ports::NetworkStream>, 
+        length: usize
+    ) -> Result<Vec<u8>, TakeoverError> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        
+        let mut body = vec![0u8; length];
+        reader.read_exact(&mut body).await
+            .map_err(|e| TakeoverError::Config(format!("Failed to read response body: {}", e)))?;
+        
+        debug!("📏 Content-Length响应体读取完成: {} 字节", body.len());
+        Ok(body)
+    }
+    
+    /// 读取直到连接关闭的响应体（HTTP/1.0方式）
+    async fn read_until_close_body(
+        &self, 
+        reader: &mut BufReader<&mut dyn crate::core::ports::NetworkStream>
+    ) -> Result<Vec<u8>, TakeoverError> {
+        let mut body = Vec::new();
+        
+        // 读取所有剩余数据直到EOF
+        match reader.read_to_end(&mut body).await {
+            Ok(bytes_read) => {
+                debug!("🔄 连接关闭式响应体读取完成: {} 字节", bytes_read);
+                Ok(body)
+            }
+            Err(e) => {
+                // 连接关闭是正常的，但其他错误需要报告
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    debug!("🔌 连接正常关闭，响应体: {} 字节", body.len());
+                    Ok(body)
+                } else {
+                    warn!("⚠️ 读取响应体时出现错误: {}, 返回已读取的 {} 字节", e, body.len());
+                    Ok(body) // 仍然返回已读取的数据
+                }
+            }
+        }
     }
     
     /// 获取统计信息
@@ -456,7 +614,7 @@ impl Default for ForwardingConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(30),
             write_timeout: Duration::from_secs(10),
-            max_retries: 2,
+            max_retries: 1,
             retry_delay: Duration::from_millis(500),
             keep_alive: false,
             max_redirects: 5,
@@ -472,7 +630,7 @@ impl Middleware for ForwardingMiddleware {
         "forwarding"
     }
     
-    #[instrument(skip(self, context, core))]
+    #[instrument(skip(self, context, core), fields(connection_id = %context.id))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -483,7 +641,7 @@ impl Middleware for ForwardingMiddleware {
             return Ok(MiddlewareResult::Continue);
         }
         
-        debug!("转发中间件开始处理连接: {}", context.id);
+        debug!("转发中间件开始处理");
         
         // 更新处理状态
         context.set_processing_state(ProcessingState::Forwarding);
@@ -509,8 +667,7 @@ impl Middleware for ForwardingMiddleware {
                 Ok(MiddlewareResult::Continue)
             }
             Err(e) => {
-                error!("❌ 请求转发失败: {} - {}", context.id, e);
-                
+                error!("⚠️ 转发失败: {} - {}", context.id, e);
                 // 记录错误
                 core.record_error().await;
                 

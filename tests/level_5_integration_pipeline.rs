@@ -252,7 +252,7 @@ async fn test_end_to_end_connection_processing() -> Result<()> {
     
     // 测试配置访问
     let config = app_core.config();
-    info!("⚙️ 配置加载成功: 最大连接数={}", config.general_config.max_connections);
+    info!("⚙️ 配置加载成功: 最大连接数={}", config.general.max_connections);
     
     // 测试端口访问
     let inbound_name = app_core.inbound_port().name();

@@ -42,6 +42,7 @@ pub use engine::{Middleware, MiddlewareResult, ProcessingEngine};
 pub use services::{StateManager, ReplayManager};
 
 use crate::error::TakeoverError;
+use crate::user_manager::UserManager;
 
 /// 应用核心 - 六边形架构的中心
 /// 
@@ -66,6 +67,9 @@ pub struct AppCore {
     
     /// 处理引擎
     engine: Arc<ProcessingEngine>,
+    
+    /// 用户管理器（防循环用户切换）
+    user_manager: Arc<UserManager>,
     
     /// 连接管理
     active_connections: Arc<RwLock<HashMap<ConnectionId, ConnectionTracker>>>,
@@ -151,10 +155,17 @@ impl AppCore {
         event_port: Arc<dyn EventPort>,
     ) -> Self {
         let config = Arc::new(config);
-        let max_connections = config.general_config.max_connections;
+        let max_connections = config.general.max_connections;
         
         // 🔧 创建处理引擎并注册默认中间件
         let engine = ProcessingEngine::new_with_defaults();
+        
+        // 🔧 创建用户管理器，使用配置中的bypass_user
+        let user_manager = if let Some(ref bypass_user) = config.inbound.bypass_user {
+            Arc::new(UserManager::with_proxy_user(bypass_user))
+        } else {
+            Arc::new(UserManager::new())
+        };
         
         Self {
             engine: Arc::new(engine),
@@ -167,6 +178,7 @@ impl AppCore {
             api_port: None,
             state_port: None,
             ui_port: None,
+            user_manager,
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(Semaphore::new(max_connections)),
             running: Arc::new(AtomicBool::new(false)),
@@ -187,7 +199,7 @@ impl AppCore {
         replay_manager: Arc<ReplayManager>,
         middlewares: Vec<Arc<dyn crate::core::engine::Middleware>>,
     ) -> Self {
-        let max_connections = config.general_config.max_connections;
+        let max_connections = config.general.max_connections;
         
         // 创建处理引擎并设置中间件
         let mut engine = ProcessingEngine::new();
@@ -197,6 +209,13 @@ impl AppCore {
         
         // 创建一个简单的事件端口实现
         let event_port = Arc::new(SimpleEventPort::new());
+        
+        // 🔧 创建用户管理器，使用配置中的bypass_user
+        let user_manager = if let Some(ref bypass_user) = config.inbound.bypass_user {
+            Arc::new(UserManager::with_proxy_user(bypass_user))
+        } else {
+            Arc::new(UserManager::new())
+        };
         
         Self {
             engine: Arc::new(engine),
@@ -209,6 +228,7 @@ impl AppCore {
             api_port: Some(api_port),
             state_port: None, // 可以在需要时添加
             ui_port: None,    // 可以在需要时添加
+            user_manager,
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(Semaphore::new(max_connections)),
             running: Arc::new(AtomicBool::new(false)),
@@ -285,6 +305,14 @@ impl AppCore {
     pub async fn run(&self) -> Result<(), TakeoverError> {
         info!("🚀 Starting AppCore");
         
+        // 🛡️ 步骤1：初始化用户管理，创建代理用户（需要sudo权限）
+        info!("🔧 初始化用户管理以防止回环");
+        self.user_manager.ensure_proxy_user().await
+            .map_err(|e| TakeoverError::Config(format!(
+                "❌ 严重错误：创建代理用户失败：{}。\n\
+                 💡 代理用户是防止回环的必需组件！\n\
+                 🔧 解决方案：使用sudo权限运行以允许创建用户", e)))?;
+        
         // 设置运行状态
         self.running.store(true, std::sync::atomic::Ordering::SeqCst);
         
@@ -300,17 +328,28 @@ impl AppCore {
         // 启动连接监听
         let mut connection_stream = self.inbound_port
             .listen(&ports::InboundConfig {
-                listen_address: self.config.inbound_config.listen_address.clone(),
-                listen_port: self.config.inbound_config.listen_port,
-                max_connections: self.config.inbound_config.max_connections,
-                buffer_size: self.config.inbound_config.buffer_size,
-                timeout: self.config.inbound_config.timeout,
-                intercepted_ports: self.config.inbound_config.intercepted_ports.clone(),
-                bypass_user: self.config.inbound_config.bypass_user.clone(),
+                listen_address: self.config.inbound.listen_address.clone(),
+                listen_port: self.config.inbound.listen_port,
+                max_connections: self.config.inbound.max_connections,
+                buffer_size: self.config.inbound.buffer_size,
+                timeout: self.config.inbound.timeout,
+                intercepted_ports: self.config.inbound.intercepted_ports.clone(),
+                bypass_user: self.config.inbound.bypass_user.clone(),
             })
             .await
             .map_err(|e| TakeoverError::Config(format!("Failed to start inbound listener: {}", e)))?;
         
+        
+        // 🛡️ 步骤2：永久切换到代理用户身份（避免每次连接都切换）
+        info!("🔄 切换到代理用户以防止回环");
+        self.user_manager.switch_to_proxy_user_permanently()
+            .map_err(|e| TakeoverError::Config(format!(
+                "❌ 严重错误：切换到代理用户失败：{}。\n\
+                 💡 这会导致无限回环！为安全起见程序已终止。\n\
+                 🔧 解决方案：使用sudo运行或确保_takeover_proxy用户存在并具有适当权限", e)))?;
+        
+        info!("✅ 成功切换到代理用户。出站连接将绕过pfctl拦截");
+
         info!("✅ AppCore started, listening for connections");
         
         // 主事件循环
@@ -346,7 +385,7 @@ impl AppCore {
     /// 处理新连接
     #[instrument(skip(self, connection))]
     async fn handle_new_connection(&self, connection: Connection) -> Result<(), TakeoverError> {
-        let conn_id = connection.id;
+        let conn_id = connection.id.clone();
         let source_addr = connection.source_addr;
         
         debug!("Handling new connection: {} from {}", conn_id, source_addr);
@@ -376,7 +415,7 @@ impl AppCore {
         // 注册连接
         {
             let mut connections = self.active_connections.write().await;
-            connections.insert(conn_id, tracker);
+            connections.insert(conn_id.clone(), tracker);
         }
         
         // 更新统计
@@ -388,7 +427,7 @@ impl AppCore {
         
         // 发布连接事件
         let _ = self.event_port.publish(ports::DomainEvent::ConnectionNew {
-            id: conn_id,
+            id: conn_id.clone(),
             addr: source_addr,
             metadata: connection_info.metadata,
         }).await;
@@ -402,7 +441,7 @@ impl AppCore {
     /// 创建连接处理任务的静态方法
     fn spawn_connection_handler(app_core: AppCore, context: ConnectionContext) {
         tokio::spawn(async move {
-            let conn_id = context.id;
+            let conn_id = context.id.clone();
             
             // 在异步任务内部获取许可，避免生命周期问题
             let permit = match app_core.connection_semaphore.acquire().await {
@@ -428,9 +467,9 @@ impl AppCore {
     }
     
     /// 处理连接的完整生命周期
-    #[instrument(skip(self, context))]
+    #[instrument(skip(self, context), fields(connection_id = %context.id))]
     async fn handle_connection_lifecycle(&self, mut context: ConnectionContext) -> Result<(), TakeoverError> {
-        let conn_id = context.id;
+        let conn_id = context.id.clone();
         
         debug!("Starting connection lifecycle for {}", conn_id);
         
@@ -539,12 +578,12 @@ impl AppCore {
         
         // 发布连接关闭事件
         let _ = self.event_port.publish(ports::DomainEvent::ConnectionClosed {
-            id: conn_id,
+            id: conn_id.clone(),
             duration,
             bytes_transferred: 0, // 默认值，后续可以从上下文获取
         }).await;
         
-        debug!("Connection {} cleaned up", conn_id);
+        debug!("Connection {} cleaned up", &conn_id);
     }
     
     /// 清理过期连接
@@ -557,7 +596,7 @@ impl AppCore {
             let connections = self.active_connections.read().await;
             for (conn_id, tracker) in connections.iter() {
                 if now.duration_since(tracker.last_activity) > timeout {
-                    expired_connections.push(*conn_id);
+                    expired_connections.push(conn_id.clone());
                 }
             }
         }
@@ -589,7 +628,7 @@ impl AppCore {
         }
         
         // 等待活跃连接完成（最多等待30秒）
-        let shutdown_timeout = Duration::from_secs(30);
+        let shutdown_timeout = Duration::from_secs(10);
         let start = Instant::now();
         
         while start.elapsed() < shutdown_timeout {
@@ -630,7 +669,7 @@ impl AppCore {
         connections
             .values()
             .map(|tracker| ConnectionSummary {
-                id: tracker.context.id,
+                id: tracker.context.id.clone(),
                 source_addr: tracker.context.connection.source_addr,
                 target_host: tracker.context.target_host.clone(),
                 target_port: tracker.context.target_port,
@@ -700,6 +739,7 @@ impl Clone for AppCore {
             state_port: self.state_port.as_ref().map(Arc::clone),
             ui_port: self.ui_port.as_ref().map(Arc::clone),
             engine: Arc::clone(&self.engine),
+            user_manager: Arc::clone(&self.user_manager),
             active_connections: Arc::clone(&self.active_connections),
             connection_semaphore: Arc::clone(&self.connection_semaphore),
             running: Arc::clone(&self.running),
@@ -799,7 +839,7 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80)
         );
         
-        let conn_id = connection.id;
+        let conn_id = connection.id.clone();
         
         // 模拟处理连接
         // 这里需要实际的连接处理逻辑，目前只测试基本功能

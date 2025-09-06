@@ -511,7 +511,7 @@ impl ReplayManager {
         
         let recorded_request = RecordedRequest {
             id: Uuid::new_v4(),
-            connection_id: context.id,
+            connection_id: context.id.clone(),
             request: request.clone(),
             response: response.cloned(),
             recorded_at: SystemTime::now(),

@@ -452,7 +452,7 @@ impl UserInterventionMiddleware {
         
         let intervention = PendingIntervention {
             id: intervention_id,
-            connection_id: context.id,
+            connection_id: context.id.clone(),
             intervention_type: intervention_type.clone(),
             original_request: context.request.clone(),
             original_response: context.response.clone(),
@@ -510,7 +510,7 @@ impl UserInterventionMiddleware {
             Ok(Ok(decision)) => {
                 self.record_intervention_completion(
                     intervention_id,
-                    context.id,
+                    context.id.clone(),
                     intervention_type,
                     Some(decision.clone()),
                     duration,
@@ -535,7 +535,7 @@ impl UserInterventionMiddleware {
                 
                 self.record_intervention_completion(
                     intervention_id,
-                    context.id,
+                    context.id.clone(),
                     intervention_type,
                     None,
                     duration,
@@ -1111,7 +1111,7 @@ impl UserInterventionMiddleware {
         let pending = self.pending_interventions.read().await;
         pending.values().map(|p| PendingIntervention {
             id: p.id,
-            connection_id: p.connection_id,
+            connection_id: p.connection_id.clone(),
             intervention_type: p.intervention_type.clone(),
             created_at: p.created_at,
             response_channel: None, // 不能克隆oneshot::Sender

@@ -64,6 +64,13 @@ demo:
 server:
 	sudo cargo run --example simple_proxy_server
 
+lv5:
+	cargo build --example http2_direct_demo
+	sudo chown root target/debug/examples/http2_direct_demo
+	sudo chmod u+s target/debug/examples/http2_direct_demo 
+	echo $$RUST_LOG
+	./target/debug/examples/http2_direct_demo
+
 rel:
 	cargo build --release --example simple_proxy_server
 	sudo chown root target/release/examples/simple_proxy_server

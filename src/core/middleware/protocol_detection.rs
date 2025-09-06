@@ -291,7 +291,7 @@ impl ProtocolDetectionMiddleware {
         mut server_stream: TcpStream,
         context: &ConnectionContext,
     ) -> Result<(), TakeoverError> {
-        let connection_id = context.id;
+        let connection_id = context.id.clone();
         info!("开始双向数据转发: {}", connection_id);
         
         let (mut client_read, mut client_write) = client_stream.split();

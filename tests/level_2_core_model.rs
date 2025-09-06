@@ -51,7 +51,7 @@ async fn test_connection_creation_and_metadata() -> Result<()> {
     // 验证连接基本属性
     assert_eq!(connection.source_addr.port(), 12345);
     assert_eq!(connection.original_dest.port(), 80);
-    assert!(connection.id != Uuid::nil());
+    assert!(connection.id.is_empty());
     
     // 验证元数据
     assert_eq!(connection.metadata.protocol, "TCP");
@@ -67,7 +67,7 @@ async fn test_connection_creation_and_metadata() -> Result<()> {
 async fn test_connection_context_lifecycle() -> Result<()> {
     // 测试连接上下文的生命周期管理
     let connection = create_test_connection();
-    let connection_id = connection.id;
+    let connection_id = connection.id.clone();
     let mut context = ConnectionContext::new(
         connection,
         "example.com".to_string(),
@@ -229,13 +229,13 @@ async fn test_connection_status_transitions() -> Result<()> {
 #[tokio::test]
 async fn test_domain_events() -> Result<()> {
     // 测试领域事件的创建和属性
-    let connection_id = Uuid::new_v4();
+    let connection_id = takeover::utils::generate_short_connection_id();
     let request_id = Uuid::new_v4();
     let source_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
     
     // 测试新连接事件
     let new_conn_event = DomainEvent::ConnectionNew {
-        id: connection_id,
+        id: connection_id.clone(),
         addr: source_addr,
         metadata: ConnectionMetadata::default(),
     };
@@ -250,7 +250,7 @@ async fn test_domain_events() -> Result<()> {
     
     // 测试连接关闭事件
     let close_event = DomainEvent::ConnectionClosed {
-        id: connection_id,
+        id: connection_id.clone(),
         duration: Duration::from_secs(30),
         bytes_transferred: 1024,
     };
@@ -265,7 +265,7 @@ async fn test_domain_events() -> Result<()> {
     
     // 测试错误事件
     let error_event = DomainEvent::Error {
-        conn_id: Some(connection_id),
+        conn_id: Some(connection_id.clone()),
         error: "Network timeout".to_string(),
         category: ErrorCategory::Network,
     };

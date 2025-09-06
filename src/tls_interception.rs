@@ -11,7 +11,7 @@
 
 use anyhow::{Result, Context};
 use crate::routing_engine::TlsInterceptionMode;
-use crate::utils;
+use crate::{utils, AppError};
 use async_trait::async_trait;
 use tokio::net::TcpStream;
 use std::collections::HashMap;
@@ -169,13 +169,12 @@ impl RustlsCertificateManager {
         // 创建目录（如果不存在）
         std::fs::create_dir_all(&cert_store_path)
             .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
-        
+
         Ok(Self::new(&cert_store_path))
     }
     
     /// 生成新的根CA证书和颁发者 (使用正确的rcgen API和完整扩展)
     fn generate_root_ca(&self) -> Result<(Issuer<'static, KeyPair>, String, String)> {
-        debug!("🔐 Generating new root CA certificate with complete extensions...");
         
         // 创建证书参数
         let mut params = CertificateParams::new(vec![
@@ -318,8 +317,12 @@ impl RustlsCertificateManager {
         let cert_path = format!("{}/takeover-root-ca.pem", self.cert_store_path);
         let key_path = format!("{}/takeover-root-ca-key.pem", self.cert_store_path);
         
+        let has_cert = std::path::Path::new(&cert_path).exists();
+        let has_key = std::path::Path::new(&key_path).exists();
+        debug!("look for root CA files: cert={}, key={}", cert_path, key_path);
+        
         // 🎯 读取已存在的证书和私钥文件
-        if std::path::Path::new(&cert_path).exists() && std::path::Path::new(&key_path).exists() {
+        if has_cert && has_key {
             debug!("Found existing root CA files: cert={}, key={}", cert_path, key_path);
             
             // 读取PEM文件内容
@@ -339,28 +342,80 @@ impl RustlsCertificateManager {
         }
         
         // 如果文件不存在，生成新的根CA
-        debug!("🔐 Generating new root CA certificate...");
+        // 一般不会执行到这里，如果到这里，就说明系统不完整，出问题了
+        debug!("找不到根CA证书:{}，生成新的根CA", cert_path);
         let (issuer, cert_pem, key_pem) = self.generate_root_ca()?;
         
-        // 保存证书和密钥到文件
-        if let Err(e) = std::fs::write(&cert_path, &cert_pem) {
-            warn!("Failed to save root CA certificate: {}", e);
-        } else {
-            debug!("📄 Root CA certificate saved to: {}", cert_path);
-        }
-        
-        if let Err(e) = std::fs::write(&key_path, &key_pem) {
-            warn!("Failed to save root CA private key: {}", e);
-        } else {
-            debug!("🔑 Root CA private key saved to: {}", key_path);
-        }
+        // 🔥 修复：保存到文件系统（确保持久化）
+        std::fs::write(&cert_path, &cert_pem)?;
+        std::fs::write(&key_path, &key_pem)?;
+        debug!("根CA证书和私钥已保存到文件: {}, {}", cert_path, key_path);
         
         // 存储到内存中
         *issuer_guard = Some(issuer);
         *cert_pem_guard = Some(cert_pem);
         
+        drop(issuer_guard);
+        drop(cert_pem_guard);
+        
+        debug!("✅ 根CA证书生成完成，已存储到文件和内存");
+        
         Ok(())
     }
+    
+    /// 根CA证书安装的核心实现（同步版本）
+    /// 
+    /// 🎯 设计原则：同步实现作为基础，异步版本通过spawn_blocking包装
+    fn install_root_ca_impl(cert_store_path: &str, cert_pem: &str) -> Result<()> {
+        let ca_path = format!("{}/takeover-root-ca.pem", cert_store_path);
+        
+        // 创建目录（同步版本）
+        if let Some(parent) = Path::new(&ca_path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        // 写入证书文件（同步版本）
+        std::fs::write(&ca_path, cert_pem)?;
+        
+        info!("Root CA certificate saved to: {}", ca_path);
+        
+        // 在macOS上使用管理员权限安装到系统钥匙串
+        #[cfg(target_os = "macos")]
+        {
+            debug!("🔐 正在将根CA证书安装到系统信任存储...");
+            
+            // 使用管理员权限安装证书
+            match utils::execute_admin_command(
+                "security", 
+                &["add-trusted-cert", "-d", "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", &ca_path]
+            ) {
+                Ok(output) => {
+                    if output.status.success() {
+                        debug!("✅ 根CA证书已成功安装到系统信任存储");
+                    } else {
+                        let error_msg = String::from_utf8_lossy(&output.stderr);
+                        info!("💡 请手动安装根CA证书: {}", ca_path);
+                        info!("   使用命令: open {}", ca_path);
+                        return Err(anyhow::anyhow!("❌ 根CA证书安装失败: {}", error_msg));
+                    }
+                },
+                Err(e) => {
+                    warn!("❌ 执行证书安装命令失败: {}", e);
+                    info!("💡 请手动安装根CA证书: {}", ca_path);
+                    info!("   使用命令: open {}", ca_path);
+                    return Err(anyhow::anyhow!("❌ 根CA证书安装失败: {}", e));
+                }
+            }
+        }
+        
+        #[cfg(not(target_os = "macos"))]
+        {
+            info!("💡 系统级证书安装仅支持macOS，请手动安装: {}", ca_path);
+        }
+        
+        Ok(())
+    }
+    
 }
 
 #[async_trait]
@@ -406,50 +461,11 @@ impl CertificateManager for RustlsCertificateManager {
             }
         };
         
-        let ca_path = format!("{}/takeover-root-ca.pem", self.cert_store_path);
-        
-        // 创建目录
-        if let Some(parent) = Path::new(&ca_path).parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        
-        // 写入证书文件
-        tokio::fs::write(&ca_path, ca_pem).await?;
-            
-        info!("Root CA certificate saved to: {}", ca_path);
-        
-        // 在macOS上使用管理员权限安装到系统钥匙串
-        #[cfg(target_os = "macos")]
-        {
-            debug!("🔐 正在将根CA证书安装到系统信任存储...");
-            
-            // 使用管理员权限安装证书
-            match utils::execute_admin_command(
-                "security", 
-                &["add-trusted-cert", "-d", "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", &ca_path]
-            ) {
-                Ok(output) => {
-                    if output.status.success() {
-                        debug!("✅  根CA证书已成功安装到系统信任存储");
-                    } else {
-                        let error_msg = String::from_utf8_lossy(&output.stderr);
-                        warn!("❌ 根CA证书安装失败: {}", error_msg);
-                        info!("💡 请手动安装根CA证书: {}", ca_path);
-                        info!("   使用命令: open {}", ca_path);
-                    }
-                },
-                Err(e) => {
-                    warn!("❌ 执行证书安装命令失败: {}", e);
-                    info!("💡 请手动安装根CA证书: {}", ca_path);
-                    info!("   使用命令: open {}", ca_path);
-                }
-            }
-        }
-        
-        #[cfg(not(target_os = "macos"))]
-        {
-            info!("💡 系统级证书安装仅支持macOS，请手动安装: {}", ca_path);
-        }
+        // 🔄 调用同步实现（异步版本通过spawn_blocking包装同步版本）
+        let cert_store_path = self.cert_store_path.clone();
+        tokio::task::spawn_blocking(move || {
+            Self::install_root_ca_impl(&cert_store_path, &ca_pem)
+        }).await??;
         
         Ok(())
     }
@@ -481,9 +497,18 @@ impl CertificateManager for RustlsCertificateManager {
                         let output_str = String::from_utf8_lossy(&output.stdout);
                         // 检查输出中是否包含我们的证书指纹
                         output_str.lines()
-                            .any(|line| line.contains("SHA-1 hash:") && 
-                                 line.replace("SHA-1 hash:", "").trim().replace(" ", "").to_uppercase()
-                                 == cert_fingerprint.to_uppercase())
+                            .any(|line| {
+                                if line.contains("SHA-1 hash:") {
+                                    let hash = line.replace("SHA-1 hash:", "").trim().replace(" ", "").to_uppercase();
+                                    let result = hash == cert_fingerprint.to_uppercase();
+                                    debug!("证书指纹对比：{}",result);
+                                    debug!("系统指纹：{}",hash);
+                                    debug!("证书文件指纹：{}",cert_fingerprint);
+                                    result
+                                } else {
+                                    false
+                                }
+                            })
                     } else {
                         false
                     }
@@ -798,13 +823,40 @@ impl Default for RuntimeTlsConfig {
 impl Default for TlsInterceptionConfig {
     fn default() -> Self {
         Self {
-            mode: TlsInterceptionMode::None,
-            intercept_domains: Vec::new(),
+            mode: TlsInterceptionMode::Selective,
+            intercept_domains: vec!["*".to_string()],
             full_intercept_domains: Vec::new(),
             cert_cache_dir: "/tmp/takeover_certs".to_string(),
             root_ca_cert_path: None,
             root_ca_key_path: None,
-            auto_install_ca: false,
+            auto_install_ca: true,
+        }
+    }
+}
+
+impl TlsInterceptionConfig {
+    /// 从AppConfig的TlsConfig创建TlsInterceptionConfig
+    pub fn from_app_config(tls_config: &crate::core::model::TlsConfig, cert_store_path: Option<&str>) -> Self {
+        let mode = match tls_config.interception_mode.as_str() {
+            "none" => TlsInterceptionMode::None,
+            "full" => TlsInterceptionMode::Full,
+            "selective" => TlsInterceptionMode::Selective,
+            _ => TlsInterceptionMode::Selective,
+        };
+        
+        let cert_cache_dir = cert_store_path
+            .map(|p| p.to_string())
+            .or_else(|| tls_config.cert_store_path.clone())
+            .unwrap_or_else(|| "/tmp/takeover_certs".to_string());
+        
+        Self {
+            mode,
+            intercept_domains: tls_config.intercept_domains.clone(),
+            full_intercept_domains: Vec::new(), // 可以后续扩展
+            cert_cache_dir,
+            root_ca_cert_path: None, // 使用动态生成
+            root_ca_key_path: None,  // 使用动态生成
+            auto_install_ca: tls_config.auto_install_ca,
         }
     }
 }
@@ -930,6 +982,20 @@ impl TlsInterceptionManager {
             runtime_config: RuntimeTlsConfig::default(),
         }
     }
+    
+    /// 创建新的TLS拦截管理器（使用真实实现和自定义配置）
+    pub fn new_real_with_config(cert_store_path: &str, config: TlsInterceptionConfig) -> Self {
+        let cert_manager = RustlsCertificateManager::new(cert_store_path);
+        let cert_manager_arc = Arc::new(cert_manager);
+        let interceptor = Arc::new(RustlsTlsInterceptor::new(cert_manager_arc.clone()));
+        
+        Self {
+            cert_manager: cert_manager_arc,
+            interceptor,
+            config,
+            runtime_config: RuntimeTlsConfig::default(),
+        }
+    }
 
     /// 创建新的TLS拦截管理器（使用默认配置目录）
     pub fn new_real_with_default_path() -> Result<Self> {
@@ -970,17 +1036,34 @@ impl TlsInterceptionManager {
     }
     
     /// 初始化TLS拦截环境
-    pub async fn initialize(&mut self) -> Result<()> {
+    /// 
+    /// 🎯 职责清晰：协调证书生成和安装的完整流程
+    pub async fn initialize(&self) -> Result<()> {
         match self.config.mode {
             TlsInterceptionMode::None => {
-                // 不需要初始化
+                debug!("TLS拦截模式为None，跳过初始化");
                 Ok(())
             }
             TlsInterceptionMode::Selective | TlsInterceptionMode::Full => {
-                // 检查并安装根CA证书
-                if self.config.auto_install_ca && !self.cert_manager.is_root_ca_installed().await {
-                    self.cert_manager.install_root_ca().await?;
+                debug!("开始初始化TLS拦截环境...");
+                
+                // 如果配置为自动安装，则安装到系统（install_root_ca会自动调用ensure_root_ca）
+                if self.config.auto_install_ca {
+                    if !self.cert_manager.is_root_ca_installed().await {
+                        debug!("根CA未安装，开始自动安装到系统信任存储");
+                        if let Err(e) = self.cert_manager.install_root_ca().await {
+                            return Err(AppError::System("根CA自动安装失败".to_string()).into());
+                        } else {
+                            debug!("✅ 根CA已安装到系统信任存储");
+                        }
+                    } else {
+                        debug!("根CA已安装，跳过安装步骤");
+                    }
+                } else {
+                    debug!("自动安装已禁用，根CA证书将在首次使用时生成");
                 }
+                let cert = self.cert_manager.get_or_generate_cert("www.aowuwu.com").await?;
+                debug!("TLS拦截环境初始化完成: ca_cert_path={:?}", cert);
                 Ok(())
             }
         }

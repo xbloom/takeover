@@ -13,8 +13,8 @@ use tokio_rustls::{server::TlsStream as InboundTlsStream};
 use tokio_rustls::{client::TlsStream as OutboundTlsStream};
 
 
-/// 连接ID类型
-pub type ConnectionId = Uuid;
+/// 连接ID类型 - 使用Sqids生成的短ID
+pub type ConnectionId = String;
 
 /// 请求ID类型  
 pub type RequestId = Uuid;
@@ -27,18 +27,14 @@ pub struct AppConfig {
     /// 版本
     pub version: String,
     /// 入站配置
-    pub inbound_config: InboundConfig,
-    /// 入站配置(别名)
     pub inbound: InboundConfig,
     /// 出站配置
-    pub outbound_config: OutboundConfig,
+    pub outbound: OutboundConfig,
     /// 脚本配置
-    pub script_config: ScriptConfig,
-    /// 脚本配置(别名)
     pub script: ScriptConfig,
+    /// TLS配置
+    pub tls: TlsConfig,
     /// 通用配置
-    pub general_config: GeneralConfig,
-    /// 通用配置(别名)
     pub general: GeneralConfig,
 }
 
@@ -87,6 +83,39 @@ pub struct ScriptConfig {
     pub timeout: Duration,
     /// 最大并发数
     pub max_concurrent: usize,
+}
+
+/// TLS配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsConfig {
+    /// 是否启用TLS拦截
+    pub enabled: bool,
+    /// 拦截模式
+    pub interception_mode: String, // "none", "selective", "full"
+    /// 需要拦截的域名模式
+    pub intercept_domains: Vec<String>,
+    /// 证书存储路径
+    pub cert_store_path: Option<String>,
+    /// 证书缓存时间（秒）
+    pub cert_cache_duration: u64,
+    /// 最大并发TLS握手数
+    pub max_concurrent_handshakes: usize,
+    /// 是否自动安装根CA到系统
+    pub auto_install_ca: bool,
+}
+
+impl Default for TlsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interception_mode: "selective".to_string(),
+            intercept_domains: vec!["*".to_string()],
+            cert_store_path: None,
+            cert_cache_duration: 24 * 60 * 60, // 24 hours
+            max_concurrent_handshakes: 100,
+            auto_install_ca: true,
+        }
+    }
 }
 
 /// 通用配置
@@ -142,7 +171,7 @@ impl std::fmt::Debug for Connection {
 impl Connection {
     pub fn new(source_addr: SocketAddr, original_dest: SocketAddr) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: crate::utils::generate_short_connection_id(),
             source_addr,
             original_dest,
             metadata: ConnectionMetadata::default(),
@@ -155,7 +184,7 @@ impl Connection {
     /// 创建带有TCP流的连接
     pub fn new_with_stream(source_addr: SocketAddr, original_dest: SocketAddr, stream: TcpStream) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: crate::utils::generate_short_connection_id(),
             source_addr,
             original_dest,
             metadata: ConnectionMetadata::default(),
@@ -168,7 +197,7 @@ impl Connection {
     /// 创建只包含元数据的连接信息（用于事件发布、跟踪等）
     pub fn clone_info(&self) -> Self {
         Self {
-            id: self.id,
+            id: self.id.clone(),
             source_addr: self.source_addr,
             original_dest: self.original_dest,
             metadata: self.metadata.clone(),
@@ -198,7 +227,7 @@ impl Connection {
 impl Clone for Connection {
     fn clone(&self) -> Self {
         Self {
-            id: self.id,
+            id: self.id.clone(),
             source_addr: self.source_addr,
             original_dest: self.original_dest,
             metadata: self.metadata.clone(),
@@ -263,7 +292,7 @@ pub struct ConnectionContext {
 
 impl ConnectionContext {
     pub fn new(connection: Connection, target_host: String, target_port: u16) -> Self {
-        let id = connection.id;
+        let id = connection.id.clone();
         Self {
             id,
             connection,
@@ -796,41 +825,21 @@ impl Default for AppConfig {
         Self {
             app_name: "takeover".to_string(),
             version: "0.1.0".to_string(),
-            inbound_config: InboundConfig {
+            inbound: InboundConfig {
                 listen_address: "127.0.0.1".to_string(),
-                listen_port: 8080,
+                listen_port: 0, // 🎯 默认使用随机端口，更安全且避免冲突
                 max_connections: 1000,
                 buffer_size: 8192,
                 timeout: Duration::from_secs(60),
                 intercepted_ports: vec![],
                 bypass_user: None,
             },
-            outbound_config: OutboundConfig {
+            outbound: OutboundConfig {
                 timeout: Duration::from_secs(30),
                 read_timeout: Duration::from_secs(30),
                 write_timeout: Duration::from_secs(30),
                 retry_count: 3,
                 retry_delay: Duration::from_secs(1),
-            },
-            script_config: ScriptConfig {
-                enabled: true,
-                script_dir: PathBuf::from("./scripts"),
-                timeout: Duration::from_secs(30),
-                max_concurrent: 10,
-            },
-            general_config: GeneralConfig {
-                max_connections: 1000,
-                connection_timeout: Duration::from_secs(3600),
-                log_level: "info".to_string(),
-            },
-            inbound: InboundConfig {
-                listen_address: "127.0.0.1".to_string(),
-                listen_port: 8080,
-                max_connections: 1000,
-                buffer_size: 8192,
-                timeout: Duration::from_secs(60),
-                intercepted_ports: vec![],
-                bypass_user: None,
             },
             script: ScriptConfig {
                 enabled: true,
@@ -838,11 +847,12 @@ impl Default for AppConfig {
                 timeout: Duration::from_secs(30),
                 max_concurrent: 10,
             },
+            tls: TlsConfig::default(),
             general: GeneralConfig {
                 max_connections: 1000,
                 connection_timeout: Duration::from_secs(3600),
                 log_level: "info".to_string(),
-            },
+            }
         }
     }
 }

@@ -76,37 +76,55 @@ impl PfInboundAdapter {
         }
     }
     
-    /// 启动透明代理监听
+    /// 启动透明代理监听（使用实际分配的随机端口）
     #[instrument(skip(self, config))]
-    async fn start_transparent_proxy(&self, config: &InboundConfig) -> Result<(), AppError> {
-        info!("Starting transparent proxy with pfctl");
+    async fn start_transparent_proxy(&self, config: &InboundConfig, actual_port: u16) -> Result<(), AppError> {
+        info!("Starting transparent proxy with pfctl using actual port: {}", actual_port);
         
-        // 获取绕过用户（通常是nobody或当前用户）
+        // 获取绕过用户
         let bypass_user = config.bypass_user.as_deref().or(Some("nobody"));
         
-        // 启动透明代理管理器
+        // 启动透明代理管理器，使用实际分配的随机端口
         let mut proxy_manager = self.proxy_manager.write().await;
         proxy_manager.start(
-            config.listen_port,
+            actual_port,  // 🎯 使用实际分配的随机端口，不是配置中的端口
             &config.intercepted_ports,
             bypass_user
-        ).await.map_err(|e| AppError::Config(format!("Failed to start transparent proxy: {}", e)))?;
+        ).await.map_err(|e| AppError::System(format!("Failed to start transparent proxy: {}", e)))?;
         
-        info!("✅ Transparent proxy started successfully");
+        info!("✅ Transparent proxy started successfully on port: {}", actual_port);
         Ok(())
     }
     
-    /// 启动本地监听器
+    /// 启动本地监听器（根据配置决定使用指定端口还是随机端口）
     #[instrument(skip(self, config))]
-    async fn start_listener(&self, config: &InboundConfig) -> Result<(), AppError> {
-        let bind_addr = format!("127.0.0.1:{}", config.listen_port);
-        debug!("Binding TCP listener to {}", bind_addr);
+    async fn start_listener(&self, config: &InboundConfig) -> Result<u16, AppError> {
+        let bind_addr = if config.listen_port == 0 {
+            // 🎯 端口为0时使用随机端口
+            debug!("Config port is 0, using random port allocation");
+            "127.0.0.1:0".to_string()
+        } else {
+            // 🎯 使用配置中指定的端口
+            debug!("Using configured port: {}", config.listen_port);
+            format!("127.0.0.1:{}", config.listen_port)
+        };
+        
+        debug!("Binding TCP listener to: {}", bind_addr);
         
         let listener = TcpListener::bind(&bind_addr)
             .await
             .map_err(|e| AppError::Config(format!("Failed to bind to {}: {}", bind_addr, e)))?;
         
-        info!("✅ TCP listener started on {}", bind_addr);
+        // 获取实际分配的端口
+        let local_addr = listener.local_addr()
+            .map_err(|e| AppError::Config(format!("Failed to get local address: {}", e)))?;
+        let actual_port = local_addr.port();
+        
+        if config.listen_port == 0 {
+            info!("✅ TCP listener started on random port: {}", actual_port);
+        } else {
+            info!("✅ TCP listener started on configured port: {}", actual_port);
+        }
         
         // 存储监听器
         {
@@ -114,7 +132,7 @@ impl PfInboundAdapter {
             *listener_guard = Some(listener);
         }
         
-        Ok(())
+        Ok(actual_port)
     }
     
     /// 从TCP流创建Connection
@@ -189,7 +207,7 @@ impl PfInboundAdapter {
                detected_protocol, original_dest.port(), target_host);
         
         let connection = Connection {
-            id: uuid::Uuid::new_v4(),
+            id: crate::utils::generate_short_connection_id(),
             source_addr,
             original_dest,
             metadata,
@@ -321,7 +339,7 @@ impl InboundPort for PfInboundAdapter {
         &self,
         config: &InboundConfig,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Connection, AppError>> + Send>>, AppError> {
-        info!("🚀 Starting pfctl inbound adapter");
+        info!("🚀 Starting pfctl inbound adapter with random port");
         
         // 保存配置
         {
@@ -329,11 +347,11 @@ impl InboundPort for PfInboundAdapter {
             *config_guard = Some(config.clone());
         }
         
-        // 启动透明代理
-        self.start_transparent_proxy(config).await?;
+        // 🎯 步骤1：启动本地监听器，根据配置决定端口
+        let actual_port = self.start_listener(config).await?;
         
-        // 启动本地监听器
-        self.start_listener(config).await?;
+        // 🎯 步骤2：使用实际端口启动透明代理
+        self.start_transparent_proxy(config, actual_port).await?;
         
         // 创建连接流
         let (sender, receiver) = mpsc::unbounded_channel();

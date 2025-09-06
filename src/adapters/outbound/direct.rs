@@ -154,7 +154,7 @@ impl DirectOutboundAdapter {
         Self {
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(60),
-            max_retries: 3,
+            max_retries: 0,
             retry_delay: Duration::from_millis(500),
             stats: Arc::new(tokio::sync::RwLock::new(DirectStats::default())),
         }
@@ -233,7 +233,7 @@ impl DirectOutboundAdapter {
         
         // 所有重试都失败了
         self.update_failure_stats().await;
-        error!("Failed to connect to {} after {} attempts", target_addr, retry_count);
+        debug!("Failed to connect to {} after {} attempts", target_addr, retry_count);
         
         Err(last_error.unwrap_or_else(|| 
             AppError::Config(format!("Failed to connect to {} after {} retries", target_addr, self.max_retries))
@@ -415,7 +415,7 @@ impl OutboundPort for DirectOutboundAdapter {
                 }
                 Err(e) => {
                     self.update_failure_stats().await;
-                    error!("❌ Failed to establish direct connection: {}", e);
+                    error!("⚠️ 🔌 无法连接服务器: {}", e);
                     Err(e)
                 }
             }

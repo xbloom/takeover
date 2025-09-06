@@ -62,7 +62,7 @@ async fn test_pf_adapter_with_custom_anchor() -> Result<()> {
 
 /// 测试入站配置的应用和验证
 #[tokio::test]
-async fn test_inbound_config_integration() -> Result<()> {
+async fn test_inbound_integration() -> Result<()> {
     println!("🧪 测试入站配置集成");
     
     // 创建测试配置（Level 1）
@@ -184,7 +184,7 @@ async fn test_connection_creation_logic() -> Result<()> {
     // 验证连接属性
     assert_eq!(connection.source_addr, source_addr);
     assert_eq!(connection.original_dest, dest_addr);
-    assert!(!connection.id.is_nil());
+    assert!(!connection.id.is_empty());
     assert_eq!(connection.metadata.protocol, "TCP");
     
     // 验证连接可以创建上下文（Level 2 集成）
@@ -360,12 +360,12 @@ async fn test_full_integration_with_previous_levels() -> Result<()> {
     
     // Level 1: 从AppConfig创建InboundConfig
     let app_config = AppConfig::default();
-    let inbound_config = &app_config.inbound_config;
+    let inbound = &app_config.inbound;
     
     // 验证配置的完整性
-    assert!(!inbound_config.listen_address.is_empty());
-    assert!(inbound_config.listen_port > 0);
-    assert!(inbound_config.max_connections > 0);
+    assert!(!inbound.listen_address.is_empty());
+    assert!(inbound.listen_port > 0);
+    assert!(inbound.max_connections > 0);
     
     // Level 2: 创建连接和上下文
     let test_connection = Connection::new(
@@ -384,13 +384,13 @@ async fn test_full_integration_with_previous_levels() -> Result<()> {
     
     // 验证适配器可以处理从Level 1来的配置
     let test_config = InboundConfig {
-        listen_address: inbound_config.listen_address.clone(),
+        listen_address: inbound.listen_address.clone(),
         listen_port: 18087, // 使用不同端口避免冲突
-        max_connections: inbound_config.max_connections,
-        buffer_size: inbound_config.buffer_size,
-        timeout: inbound_config.timeout,
-        intercepted_ports: inbound_config.intercepted_ports.clone(),
-        bypass_user: inbound_config.bypass_user.clone(),
+        max_connections: inbound.max_connections,
+        buffer_size: inbound.buffer_size,
+        timeout: inbound.timeout,
+        intercepted_ports: inbound.intercepted_ports.clone(),
+        bypass_user: inbound.bypass_user.clone(),
     };
     
     // 验证配置应用
@@ -491,7 +491,7 @@ pub async fn run_all_level_3_tests() -> Result<()> {
         
         assert_eq!(connection.source_addr, source_addr);
         assert_eq!(connection.original_dest, dest_addr);
-        assert!(!connection.id.is_nil());
+        assert!(!connection.id.is_empty());
         assert_eq!(connection.metadata.protocol, "TCP");
         
         let context = ConnectionContext::new(
@@ -511,11 +511,11 @@ pub async fn run_all_level_3_tests() -> Result<()> {
     println!("🧪 测试与前两个级别的完整集成");
     {
         let app_config = AppConfig::default();
-        let inbound_config = &app_config.inbound_config;
+        let inbound = &app_config.inbound;
         
-        assert!(!inbound_config.listen_address.is_empty());
-        assert!(inbound_config.listen_port > 0);
-        assert!(inbound_config.max_connections > 0);
+        assert!(!inbound.listen_address.is_empty());
+        assert!(inbound.listen_port > 0);
+        assert!(inbound.max_connections > 0);
         
         let test_connection = Connection::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345),
@@ -531,13 +531,13 @@ pub async fn run_all_level_3_tests() -> Result<()> {
         let adapter = PfInboundAdapter::new();
         
         let test_config = InboundConfig {
-            listen_address: inbound_config.listen_address.clone(),
+            listen_address: inbound.listen_address.clone(),
             listen_port: 18087,
-            max_connections: inbound_config.max_connections,
-            buffer_size: inbound_config.buffer_size,
-            timeout: inbound_config.timeout,
-            intercepted_ports: inbound_config.intercepted_ports.clone(),
-            bypass_user: inbound_config.bypass_user.clone(),
+            max_connections: inbound.max_connections,
+            buffer_size: inbound.buffer_size,
+            timeout: inbound.timeout,
+            intercepted_ports: inbound.intercepted_ports.clone(),
+            bypass_user: inbound.bypass_user.clone(),
         };
         
         let result = timeout(Duration::from_secs(1), async {

@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     
     // 配置
     let socks5_proxy_port = 7897;           // 外部SOCKS5代理端口
-    let intercepted_ports = vec![80, 443];  // 要拦截的端口
+    let intercepted_ports = vec![80];  // 要拦截的端口
         
     // 配置SOCKS5代理
     let proxy_config = ProxyConfig {

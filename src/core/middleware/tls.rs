@@ -10,14 +10,14 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{warn, error, debug, info, instrument};
 use async_trait::async_trait;
 
 use crate::core::engine::{Middleware, MiddlewareResult};
-use crate::core::model::{ConnectionContext, ProcessingState};
+use crate::core::model::{ConnectionContext, ProcessingState, TlsConfig};
 use crate::core::ports::AppError;
 use crate::tls_interception::{
-    TlsInterceptionManager, RuntimeTlsConfig, TlsCertificate
+    TlsInterceptionManager, RuntimeTlsConfig, TlsCertificate, TlsInterceptionConfig
 };
 use tokio_rustls::{TlsAcceptor, server::TlsStream as ServerTlsStream};
 use rustls::ServerConfig;
@@ -112,7 +112,8 @@ impl TlsMiddleware {
         
         // 如果配置启用，自动初始化TLS拦截
         if middleware.config.enabled {
-            if let Err(e) = middleware.enable_tls_interception(None) {
+            let cert_store_path = middleware.config.cert_store_path.clone();
+            if let Err(e) = middleware.enable_tls_interception(cert_store_path.as_deref()) {
                 warn!("Failed to auto-enable TLS interception with config: {}, falling back to mock mode", e);
             }
         }
@@ -126,22 +127,57 @@ impl TlsMiddleware {
             return Ok(());
         }
         
+        // 🎯 关键修复：从TlsMiddlewareConfig创建TlsInterceptionConfig
+        let tls_config = TlsConfig {
+            enabled: self.config.enabled,
+            interception_mode: match self.config.interception_mode {
+                TlsInterceptionMode::None => "none".to_string(),
+                TlsInterceptionMode::Full => "full".to_string(),
+                TlsInterceptionMode::Selective => "selective".to_string(),
+            },
+            intercept_domains: self.config.intercept_domains.clone(),
+            cert_store_path: self.config.cert_store_path.clone(),
+            cert_cache_duration: self.config.cert_cache_duration.as_secs(),
+            max_concurrent_handshakes: self.config.max_concurrent_handshakes,
+            auto_install_ca: true, // 默认启用自动安装
+        };
+        let tls_interception_config = TlsInterceptionConfig::from_app_config(&tls_config, cert_store_path);
+        
         let tls_manager = match cert_store_path {
-            Some(path) => TlsInterceptionManager::new_real(path),
-            None => TlsInterceptionManager::new_real_with_default_path()
-                .map_err(|e| AppError::Config(format!("Failed to create TLS manager: {}", e)))?,
+            Some(path) => TlsInterceptionManager::new_real_with_config(path, tls_interception_config),
+            None => {
+                // 使用默认路径创建
+                let home_dir = std::env::var("HOME")
+                    .map_err(|_| AppError::Config("Cannot find HOME directory".to_string()))?;
+                let default_path = format!("{}/.config/takeover", home_dir);
+                std::fs::create_dir_all(&default_path)
+                    .map_err(|e| AppError::Config(format!("Failed to create config directory: {}", e)))?;
+                TlsInterceptionManager::new_real_with_config(&default_path, tls_interception_config)
+            }
         };
         
         // 设置运行时配置
         let mut runtime_config = RuntimeTlsConfig::default();
         runtime_config.enabled = true;
         runtime_config.mode = self.config.interception_mode.clone();
+        runtime_config.intercept_domains = self.config.intercept_domains.clone();
         
         let mut tls_manager = tls_manager;
         tls_manager.set_runtime_config(runtime_config);
-        self.tls_manager = Some(Arc::new(tls_manager));
+        let tls_manager_arc = Arc::new(tls_manager);
         
-        debug!("✅ TLS拦截功能已启用");
+        // 🎯 关键修复：在后台立即启动根CA安装
+        let tls_manager_clone = Arc::clone(&tls_manager_arc);
+        tokio::spawn(async move {
+            if let Err(e) = tls_manager_clone.initialize().await {
+                error!("❌ 根CA安装失败: {}", e);
+                error!("💡 请确保以sudo权限运行程序以安装系统证书");
+            }
+        });
+        
+        self.tls_manager = Some(tls_manager_arc);
+        
+        debug!("✅ TLS拦截功能已启用，根CA安装正在后台进行");
         Ok(())
     }
     
@@ -262,7 +298,7 @@ impl TlsMiddleware {
     }
     
     /// 执行TLS拦截 - 现代化实现
-    #[instrument(skip(self, context))]
+    #[instrument(skip(self, context), fields(connection_id = %context.id))]
     async fn perform_tls_interception(&self, context: &mut ConnectionContext) -> Result<(), AppError> {
         let domain = &context.target_host;
         let port = context.target_port;
@@ -520,19 +556,42 @@ impl Default for TlsMiddlewareConfig {
     }
 }
 
+impl From<&TlsConfig> for TlsMiddlewareConfig {
+    fn from(config: &TlsConfig) -> Self {
+        let interception_mode = match config.interception_mode.as_str() {
+            "none" => TlsInterceptionMode::None,
+            "full" => TlsInterceptionMode::Full,
+            "selective" => TlsInterceptionMode::Selective,
+            _ => {
+                warn!("Unknown TLS interception mode '{}', falling back to selective", config.interception_mode);
+                TlsInterceptionMode::Selective
+            }
+        };
+        
+        Self {
+            enabled: config.enabled,
+            interception_mode,
+            intercept_domains: config.intercept_domains.clone(),
+            cert_store_path: config.cert_store_path.clone(),
+            cert_cache_duration: Duration::from_secs(config.cert_cache_duration),
+            max_concurrent_handshakes: config.max_concurrent_handshakes,
+        }
+    }
+}
+
 #[async_trait]
 impl Middleware for TlsMiddleware {
     fn name(&self) -> &str {
         "tls"
     }
     
-    #[instrument(skip(self, context, _core))]
+    #[instrument(skip(self, context, _core), fields(connection_id = %context.id))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
         _core: &crate::core::AppCore,
     ) -> Result<MiddlewareResult, crate::error::TakeoverError> {
-        debug!("TLS middleware processing connection {}", context.id);
+        debug!("TLS中间件开始处理");
         
         // 更新处理状态
         context.set_processing_state(ProcessingState::TlsHandshake);
