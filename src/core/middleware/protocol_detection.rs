@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{info, warn, debug, instrument};
 use async_trait::async_trait;
 
 use crate::core::engine::{Middleware, MiddlewareResult};
@@ -100,7 +100,7 @@ impl ProtocolDetectionMiddleware {
     
     /// 检测TCP流的协议类型
     #[instrument(skip(self, stream))]
-    async fn detect_protocol(&self, stream: &TcpStream) -> Result<ProtocolType, TakeoverError> {
+     async fn detect_protocol(&self, stream: &TcpStream, context: &ConnectionContext) -> Result<ProtocolType, TakeoverError> {
         let mut buffer = vec![0u8; self.config.peek_buffer_size];
         
         // 使用peek非侵入式读取数据
@@ -119,13 +119,16 @@ impl ProtocolDetectionMiddleware {
             }
         };
         
+        debug!("协议检测: 目标{}:{}, 读取{}字节", context.target_host, context.target_port, bytes_read);
+        
+        // 数据不足时的处理策略
         if bytes_read < 3 {
-            debug!("数据不足，推断为未知协议: {} bytes", bytes_read);
-            return Ok(ProtocolType::Unknown);
+            debug!("数据不足({} bytes)，使用端口启发式检测", bytes_read);
+            return Ok(self.detect_by_port_heuristic(context));
         }
         
         let data = &buffer[..bytes_read];
-        debug!("协议检测: 读取{}字节: {:02x?}", bytes_read, &data[..bytes_read.min(8)]);
+        debug!("协议检测数据: {:02x?}", &data[..bytes_read.min(8)]);
         
         // 1. 检测TLS握手
         if self.is_tls_handshake(data) {
@@ -151,8 +154,50 @@ impl ProtocolDetectionMiddleware {
             return Ok(db_protocol);
         }
         
-        debug!("❓ 未识别协议，标记为未知");
-        Ok(ProtocolType::Unknown)
+        // 5. 数据无法识别时，使用端口启发式检测
+        debug!("❓ 数据未识别，使用端口启发式检测");
+        Ok(self.detect_by_port_heuristic(context))
+    }
+    
+    /// 基于端口的启发式协议检测
+    /// 
+    /// 当数据不足或无法识别时，基于已知端口进行合理推断
+    fn detect_by_port_heuristic(&self, context: &ConnectionContext) -> ProtocolType {
+        match context.target_port {
+            // HTTP明文端口
+            80 | 8080 | 8000 | 3000 | 5000 | 8888 => {
+                debug!("🌐 端口{}推断为HTTP明文协议", context.target_port);
+                ProtocolType::HttpCleartext
+            }
+            // HTTPS端口
+            443 | 8443 | 9443 => {
+                debug!("🔐 端口{}推断为TLS协议", context.target_port);
+                ProtocolType::Tls
+            }
+            // SSH端口
+            22 => {
+                debug!("🔑 端口{}推断为SSH协议", context.target_port);
+                ProtocolType::Ssh
+            }
+            // 数据库端口
+            3306 => {
+                debug!("🗃️ 端口{}推断为MySQL协议", context.target_port);
+                ProtocolType::Mysql
+            }
+            5432 => {
+                debug!("🗃️ 端口{}推断为PostgreSQL协议", context.target_port);
+                ProtocolType::Postgresql
+            }
+            6379 => {
+                debug!("🗃️ 端口{}推断为Redis协议", context.target_port);
+                ProtocolType::Redis
+            }
+            // 其他端口
+            _ => {
+                debug!("❓ 端口{}无法推断协议，标记为未知", context.target_port);
+                ProtocolType::Unknown
+            }
+        }
     }
     
     /// 检测TLS握手包
@@ -264,7 +309,7 @@ impl ProtocolDetectionMiddleware {
         &self,
         context: &ConnectionContext,
         core: &crate::core::AppCore,
-    ) -> Result<TcpStream, TakeoverError> {
+    ) -> Result<Box<dyn crate::core::ports::NetworkStream>, TakeoverError> {
         debug!("连接到目标服务器: {}:{}", context.target_host, context.target_port);
         
         // 使用出站适配器建立连接
@@ -272,15 +317,8 @@ impl ProtocolDetectionMiddleware {
         let stream = outbound_port.connect(context).await
             .map_err(|e| TakeoverError::Config(format!("Failed to connect to target: {}", e)))?;
         
-        // 转换为TcpStream（需要适配器支持）
-        // 注意：这里简化处理，实际可能需要更复杂的适配
-        match stream.try_into_tcp_stream() {
-            Ok(tcp_stream) => Ok(tcp_stream),
-            Err(_) => {
-                error!("出站适配器返回的流无法转换为TcpStream");
-                Err(TakeoverError::Config("Cannot convert outbound stream to TcpStream".to_string()))
-            }
-        }
+        debug!("✅ 成功建立到目标服务器的连接: {}:{}", context.target_host, context.target_port);
+        Ok(stream)
     }
     
     /// 双向数据拷贝
@@ -288,14 +326,16 @@ impl ProtocolDetectionMiddleware {
     async fn bidirectional_copy(
         &self,
         mut client_stream: TcpStream,
-        mut server_stream: TcpStream,
+        server_stream: Box<dyn crate::core::ports::NetworkStream>,
         context: &ConnectionContext,
     ) -> Result<(), TakeoverError> {
         let connection_id = context.id.clone();
         info!("开始双向数据转发: {}", connection_id);
         
         let (mut client_read, mut client_write) = client_stream.split();
-        let (mut server_read, mut server_write) = server_stream.split();
+        let (server_read, server_write) = tokio::io::split(server_stream);
+        let mut server_read = Box::pin(server_read);
+        let mut server_write = Box::pin(server_write);
         
         // 客户端→服务器方向
         let c2s_task = async {
@@ -438,7 +478,7 @@ impl Middleware for ProtocolDetectionMiddleware {
         };
         
         // 检测协议类型
-        let protocol = match self.detect_protocol(tcp_stream).await {
+        let protocol = match self.detect_protocol(tcp_stream, context).await {
             Ok(protocol) => {
                 debug!("协议检测成功: {:?}", protocol);
                 protocol
@@ -446,8 +486,8 @@ impl Middleware for ProtocolDetectionMiddleware {
             Err(e) => {
                 warn!("协议检测失败: {}", e);
                 self.update_failure_stats().await;
-                // 检测失败时假设为未知协议，继续透传
-                ProtocolType::Unknown
+                // 检测失败时使用端口启发式检测
+                self.detect_by_port_heuristic(context)
             }
         };
         
@@ -507,17 +547,7 @@ impl Middleware for ProtocolDetectionMiddleware {
     }
 }
 
-// 临时的trait扩展，直到出站适配器支持TcpStream转换
-trait NetworkStreamExt {
-    fn try_into_tcp_stream(self) -> Result<TcpStream, Box<dyn std::error::Error>>;
-}
-
-impl NetworkStreamExt for Box<dyn crate::core::ports::NetworkStream> {
-    fn try_into_tcp_stream(self) -> Result<TcpStream, Box<dyn std::error::Error>> {
-        // 这是一个简化实现，实际需要适配器支持
-        Err("TcpStream conversion not yet implemented".into())
-    }
-}
+// Copy Pipe透传现在直接使用NetworkStream，无需TcpStream转换
 
 #[cfg(test)]
 mod tests {

@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{info, error, debug, instrument};
+use tracing::{info, warn, debug, instrument};
 use async_trait::async_trait;
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
-use rustls::{ClientConfig, RootCertStore};
+use rustls::ClientConfig;
 use std::sync::Arc as StdArc;
 
 use crate::core::ports::{OutboundPort, NetworkStream, AppError};
@@ -57,11 +57,15 @@ struct DirectNetworkStream {
     /// 底层TCP流
     stream: TcpStream,
     /// 目标地址信息
+    #[allow(dead_code)]
     target_host: String,
+    #[allow(dead_code)]
     target_port: u16,
     /// 本地地址
+    #[allow(dead_code)]
     local_addr: std::net::SocketAddr,
     /// 远程地址
+    #[allow(dead_code)]
     remote_addr: std::net::SocketAddr,
 }
 
@@ -70,7 +74,9 @@ struct DirectTlsNetworkStream {
     /// 底层TLS流
     stream: ClientTlsStream<TcpStream>,
     /// 目标地址信息
+    #[allow(dead_code)]
     target_host: String,
+    #[allow(dead_code)]
     target_port: u16,
 }
 
@@ -191,8 +197,9 @@ impl DirectOutboundAdapter {
         
         debug!("Attempting direct connection to {}", target_addr);
         
-        let mut last_error = None;
         let mut retry_count = 0;
+        #[allow(unused_assignments)]
+        let mut final_error = AppError::Config(format!("Failed to connect to {} after {} retries", target_addr, self.max_retries));
         
         loop {
             // 更新统计
@@ -212,11 +219,11 @@ impl DirectOutboundAdapter {
                     return Ok(stream);
                 }
                 Ok(Err(e)) => {
-                    last_error = Some(AppError::Config(format!("Connection failed: {}", e)));
+                    final_error = AppError::Config(format!("Connection failed: {}", e));
                 }
                 Err(_) => {
                     // 超时
-                    last_error = Some(AppError::Config(format!("Connection to {} timed out", target_addr)));
+                    final_error = AppError::Config(format!("Connection to {} timed out", target_addr));
                     self.update_timeout_stats().await;
                 }
             }
@@ -235,12 +242,11 @@ impl DirectOutboundAdapter {
         self.update_failure_stats().await;
         debug!("Failed to connect to {} after {} attempts", target_addr, retry_count);
         
-        Err(last_error.unwrap_or_else(|| 
-            AppError::Config(format!("Failed to connect to {} after {} retries", target_addr, self.max_retries))
-        ))
+        Err(final_error)
     }
     
     /// 检查目标是否可达
+    #[allow(dead_code)]
     async fn is_target_reachable(&self, target_host: &str, target_port: u16) -> bool {
         // 简单的连通性检查
         let target_addr = format!("{}:{}", target_host, target_port);
@@ -386,7 +392,7 @@ impl OutboundPort for DirectOutboundAdapter {
                 }
                 Err(e) => {
                     self.update_failure_stats().await;
-                    error!("❌ Failed to establish TLS connection: {}", e);
+                    warn!("❌ Failed to establish TLS connection: {}", e);
                     Err(e)
                 }
             }
@@ -415,7 +421,7 @@ impl OutboundPort for DirectOutboundAdapter {
                 }
                 Err(e) => {
                     self.update_failure_stats().await;
-                    error!("⚠️ 🔌 无法连接服务器: {}", e);
+                    warn!("⚠️ 🔌 无法连接服务器: {}", e);
                     Err(e)
                 }
             }
@@ -496,6 +502,7 @@ impl tokio::io::AsyncWrite for DirectNetworkStream {
 
 impl DirectNetworkStream {
     /// 获取连接信息
+    #[allow(dead_code)]
     pub fn connection_info(&self) -> ConnectionInfo {
         ConnectionInfo {
             target_host: self.target_host.clone(),
@@ -563,7 +570,6 @@ impl Default for DirectOutboundAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::{Connection, ConnectionMetadata};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     
     #[tokio::test]
@@ -642,14 +648,5 @@ mod tests {
         assert_eq!(info.target_host, "example.com");
         assert_eq!(info.target_port, 80);
         assert_eq!(info.connection_type, "direct");
-    }
-    
-    fn create_test_context() -> ConnectionContext {
-        let connection = Connection::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80)
-        );
-        
-        ConnectionContext::new(connection, "example.com".to_string(), 80)
     }
 }

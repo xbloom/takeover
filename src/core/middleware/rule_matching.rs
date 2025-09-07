@@ -15,7 +15,7 @@ use crate::core::engine::{Middleware, MiddlewareResult};
 use crate::core::model::{ConnectionContext, ProcessingState, Rule, RequestModifications};
 use crate::core::model::{RulePattern, RuleAction};
 use crate::core::ports::AppError;
-use crate::routing_engine::{RoutingEngine, RoutingDecision, RoutingRules, UrlRewriteRule, TlsInterceptionMode};
+use crate::routing_engine::{RoutingEngine, RoutingDecision, TlsInterceptionMode};
 
 /// 规则匹配中间件
 /// 
@@ -72,7 +72,7 @@ pub enum PriorityMode {
 
 /// 规则匹配统计
 #[derive(Debug, Default, Clone)]
-struct RuleMatchingStats {
+pub struct RuleMatchingStats {
     /// 总处理连接数
     total_connections: u64,
     /// 规则匹配数
@@ -86,6 +86,7 @@ struct RuleMatchingStats {
     /// 拒绝决策数
     denied_decisions: u64,
     /// URL重写次数
+    #[allow(dead_code)]
     url_rewrites: u64,
     /// 规则匹配详情
     rule_match_details: HashMap<String, u64>,
@@ -705,8 +706,7 @@ impl Middleware for RuleMatchingMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::{Connection, ConnectionMetadata, RulePattern, RuleAction};
-    use crate::core::ports::ProxyConfig;
+    use crate::core::model::{Connection, RulePattern, RuleAction};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     
     #[tokio::test]

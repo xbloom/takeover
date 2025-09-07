@@ -11,7 +11,7 @@
 
 use anyhow::{Result, Context};
 use crate::routing_engine::TlsInterceptionMode;
-use crate::{utils, AppError};
+use crate::{utils, core::AppError};
 use async_trait::async_trait;
 use tokio::net::TcpStream;
 use std::collections::HashMap;
@@ -1051,7 +1051,7 @@ impl TlsInterceptionManager {
                 if self.config.auto_install_ca {
                     if !self.cert_manager.is_root_ca_installed().await {
                         debug!("根CA未安装，开始自动安装到系统信任存储");
-                        if let Err(e) = self.cert_manager.install_root_ca().await {
+                        if let Err(_e) = self.cert_manager.install_root_ca().await {
                             return Err(AppError::System("根CA自动安装失败".to_string()).into());
                         } else {
                             debug!("✅ 根CA已安装到系统信任存储");

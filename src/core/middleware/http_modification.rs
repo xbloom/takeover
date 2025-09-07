@@ -12,7 +12,7 @@ use tracing::{info, warn, error, debug, instrument};
 use async_trait::async_trait;
 
 use crate::core::engine::{Middleware, MiddlewareResult};
-use crate::core::model::{ConnectionContext, ProcessingState, HttpRequest, HttpResponse, RequestModifications, ResponseModifications};
+use crate::core::model::{ConnectionContext, ProcessingState, RequestModifications, ResponseModifications};
 use crate::core::ports::AppError;
 
 /// HTTP修改中间件
@@ -104,7 +104,7 @@ pub enum ModificationAction {
 
 /// HTTP修改统计
 #[derive(Debug, Default, Clone)]
-struct HttpModificationStats {
+pub struct HttpModificationStats {
     /// 总处理请求数
     total_requests: u64,
     /// 总修改次数
@@ -112,6 +112,7 @@ struct HttpModificationStats {
     /// 请求修改次数
     request_modifications: u64,
     /// 响应修改次数
+    #[allow(dead_code)]
     response_modifications: u64,
     /// 头部添加次数
     headers_added: u64,
@@ -310,7 +311,8 @@ impl HttpModificationMiddleware {
                     }
                 }
                 ModificationAction::AddAuth { username, password } => {
-                    let auth_value = format!("Basic {}", base64::encode(format!("{}:{}", username, password)));
+                    use base64::prelude::*;
+                    let auth_value = format!("Basic {}", BASE64_STANDARD.encode(format!("{}:{}", username, password)));
                     request.headers.insert("Authorization".to_string(), auth_value);
                     Ok(true)
                 }
@@ -640,7 +642,7 @@ impl Middleware for HttpModificationMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::{Connection, ConnectionMetadata, HttpRequest};
+    use crate::core::model::{Connection, HttpRequest};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     
     #[tokio::test]

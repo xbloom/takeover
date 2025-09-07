@@ -9,7 +9,7 @@
 //! - 错误处理和降级
 
 use std::sync::Arc;
-use std::collections::{HashMap, BTreeMap};
+use std::collections::HashMap;
 use std::time::{Duration, SystemTime, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn, error, debug, instrument};
@@ -248,6 +248,7 @@ pub struct PerformanceMetrics {
 #[derive(Debug, Clone)]
 struct CachedMergeResult {
     /// 缓存键
+    #[allow(dead_code)]
     key: String,
     /// 合并后的响应
     response: HttpResponse,
@@ -256,8 +257,10 @@ struct CachedMergeResult {
     /// 过期时间
     expires_at: Instant,
     /// 命中次数
+    #[allow(dead_code)]
     hit_count: u64,
     /// 合并元数据
+    #[allow(dead_code)]
     metadata: MergeMetadata,
 }
 
@@ -401,6 +404,7 @@ struct HeaderMergeStrategy;
 struct AppendMergeStrategy;
 
 /// 自定义Lua合并策略处理器
+#[allow(dead_code)]
 struct LuaMergeStrategy {
     script_content: String,
 }

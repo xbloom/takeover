@@ -61,13 +61,14 @@ pub struct LuaApiConfig {
 /// HTTP客户端包装器
 struct HttpClient {
     client: reqwest::Client,
+    #[allow(dead_code)]
     config: LuaApiConfig,
     stats: Arc<RwLock<HttpStats>>,
 }
 
 /// HTTP统计
 #[derive(Debug, Default, Clone)]
-struct HttpStats {
+pub struct HttpStats {
     total_requests: u64,
     successful_requests: u64,
     failed_requests: u64,
@@ -86,7 +87,7 @@ type EventListener = Box<dyn Fn(&CustomEvent) + Send + Sync>;
 
 /// API统计
 #[derive(Debug, Default, Clone)]
-struct ApiStats {
+pub struct ApiStats {
     http_requests: u64,
     log_messages: u64,
     config_accesses: u64,
@@ -449,7 +450,6 @@ impl ApiPort for LuaApiAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::HttpRequest;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     
     #[tokio::test]

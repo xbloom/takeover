@@ -449,6 +449,7 @@ impl Default for TransparentConnectionParser {
 }
 
 /// 未来TLS拦截能力的预留接口
+#[allow(async_fn_in_trait)]
 pub trait TlsInterceptionCapable {
     /// 检查是否可以拦截指定域名的TLS
     async fn can_intercept_tls(&self, sni: &str) -> bool;

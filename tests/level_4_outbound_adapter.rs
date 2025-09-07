@@ -6,7 +6,6 @@
 //! 3. 连接管理、超时处理、统计收集
 //! 4. 与之前级别（配置、核心模型、入站适配器）的集成测试
 
-use std::sync::Arc;
 use std::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::time::timeout;
@@ -14,8 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use anyhow::Result;
 
 use takeover::{
-    AppConfig, Connection, ConnectionContext, InboundConfig, OutboundConfig,
-    GeneralConfig, ScriptConfig
+    AppConfig, Connection, ConnectionContext, OutboundConfig
 };
 use takeover::adapters::outbound::{DirectOutboundAdapter, Socks5OutboundAdapter};
 use takeover::core::ports::OutboundPort;
@@ -376,7 +374,7 @@ async fn test_full_integration_with_previous_levels() -> Result<()> {
     println!("🔗 集成Level 3: 入站适配器概念");
     // 模拟入站适配器创建的连接被出站适配器处理
     let direct_adapter = DirectOutboundAdapter::new();
-    let socks5_adapter = Socks5OutboundAdapter::new();
+    let _socks5_adapter = Socks5OutboundAdapter::new();
     
     // 测试出站适配器可以处理入站连接
     assert!(direct_adapter.supports_target(&context).await);

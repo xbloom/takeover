@@ -6,13 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{error, debug, instrument};
 use async_trait::async_trait;
 
 use crate::core::ports::{OutboundPort, NetworkStream, AppError};
 use crate::core::model::ConnectionContext;
 use crate::core::ports::ProxyConfig;
-use crate::socks5::{Socks5Client, DataForwarder};
+use crate::socks5::Socks5Client;
 
 /// SOCKS5出站适配器
 /// 
@@ -50,9 +50,12 @@ struct Socks5NetworkStream {
     /// 底层TCP流
     stream: TcpStream,
     /// 目标地址信息
+    #[allow(dead_code)]
     target_host: String,
+    #[allow(dead_code)]
     target_port: u16,
     /// 代理信息
+    #[allow(dead_code)]
     proxy_addr: String,
 }
 
@@ -143,7 +146,7 @@ impl Socks5OutboundAdapter {
     }
     
     /// 获取要使用的代理配置
-    fn get_proxy_config(&self, context: &ConnectionContext) -> Option<&ProxyConfig> {
+    fn get_proxy_config(&self, _context: &ConnectionContext) -> Option<&ProxyConfig> {
         // 优先使用连接上下文中的代理配置
         // 如果没有，使用默认配置
         self.default_proxy.as_ref()
@@ -299,7 +302,7 @@ impl Default for Socks5OutboundAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::{Connection, ConnectionMetadata};
+    use crate::core::model::{Connection};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     
     #[tokio::test]

@@ -195,8 +195,8 @@ impl AppCore {
         control_port: Arc<dyn ControlPort>,
         script_port: Arc<dyn ScriptPort>,
         api_port: Arc<dyn ApiPort>,
-        state_manager: Arc<StateManager>,
-        replay_manager: Arc<ReplayManager>,
+        _state_manager: Arc<StateManager>,
+        _replay_manager: Arc<ReplayManager>,
         middlewares: Vec<Arc<dyn crate::core::engine::Middleware>>,
     ) -> Self {
         let max_connections = config.general.max_connections;
@@ -452,15 +452,10 @@ impl AppCore {
                 }
             };
             
-            let result = app_core.handle_connection_lifecycle(context).await;
+            let _result = app_core.handle_connection_lifecycle(context).await;
             
             // 释放连接许可
             drop(permit);
-            
-            if let Err(e) = result {
-                error!("Connection {} failed: {}", conn_id, e);
-            }
-            
             // 清理连接
             app_core.cleanup_connection(conn_id).await;
         });
@@ -494,7 +489,7 @@ impl AppCore {
                 self.handle_paused_connection(context, reason).await?;
             }
             Ok(MiddlewareResult::Reject(reason)) => {
-                warn!("Connection {} rejected: {}", conn_id, reason);
+                debug!("Connection {} rejected: {}", conn_id, reason);
                 self.update_connection_status(conn_id, ConnectionStatus::Error(reason.clone())).await;
                 return Err(TakeoverError::Config(reason));
             }
@@ -504,7 +499,7 @@ impl AppCore {
                 self.handle_redirect(context, url).await?;
             }
             Err(e) => {
-                error!("Connection {} processing failed: {}", conn_id, e);
+                debug!(" Connection {} processing failed: {}", conn_id, e);
                 self.update_connection_status(conn_id, ConnectionStatus::Error(e.to_string())).await;
                 return Err(e);
             }

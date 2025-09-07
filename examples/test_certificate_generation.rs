@@ -3,7 +3,7 @@
 //! 这个例子测试新的TLS证书生成功能，验证Chrome信任要求的扩展字段
 
 use anyhow::Result;
-use takeover::tls_interception::{TlsInterceptionManager, CertificateManager};
+use takeover::tls_interception::{TlsInterceptionManager};
 use tracing::{info, Level};
 use tracing_subscriber;
 

@@ -323,7 +323,6 @@ async fn test_config_validation() -> Result<()> {
     
     // 基本验证 - 端口号应该在有效范围内
     assert!(valid_config.inbound.listen_port > 0);
-    assert!(valid_config.inbound.listen_port <= 65535);
     
     // 最大连接数应该合理
     assert!(valid_config.inbound.max_connections > 0);
@@ -518,7 +517,6 @@ pub async fn run_all_level_1_tests() -> Result<()> {
         
         // 基本验证 - 端口号应该在有效范围内
         assert!(valid_config.inbound.listen_port > 0);
-        assert!(valid_config.inbound.listen_port <= 65535);
         
         // 最大连接数应该合理
         assert!(valid_config.inbound.max_connections > 0);

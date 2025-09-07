@@ -8,7 +8,6 @@
 
 use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::collections::HashMap;
 use tracing::{info, error};
 use anyhow::Result;
 
@@ -27,7 +26,6 @@ use takeover::core::middleware::{
 use async_trait::async_trait;
 use std::pin::Pin;
 use futures::Stream;
-use uuid::Uuid;
 
 /// Level 5集成测试 - 完整Pipeline端到端测试
 pub async fn run_all_level_5_tests() -> Result<()> {
@@ -159,7 +157,7 @@ async fn test_complete_middleware_pipeline() -> Result<()> {
     engine.add_middleware(Arc::new(HttpModificationMiddleware::new()));
     
     // 创建测试配置
-    let config = AppConfig::default();
+    let _config = AppConfig::default();
     
     // 构建Pipeline
     let pipeline = engine.get_default_pipeline();
@@ -208,14 +206,14 @@ async fn test_child_pipeline_factory() -> Result<()> {
     engine.add_middleware(Arc::new(HttpModificationMiddleware::new())); // 优先级 50
     
     // 测试创建子Pipeline（从Rule中间件开始，优先级30+）
-    let child_pipeline = engine.create_child_pipeline(30);
+    let _child_pipeline = engine.create_child_pipeline(30);
     
     // 验证子Pipeline只包含指定优先级的中间件
     // 在实际实现中，可以添加方法来检查Pipeline中的中间件数量
     info!("✅ 子Pipeline创建成功，包含优先级30+的中间件");
     
     // 测试创建另一个子Pipeline（从HTTP修改开始，优先级50+）
-    let focused_child_pipeline = engine.create_child_pipeline(50);
+    let _focused_child_pipeline = engine.create_child_pipeline(50);
     info!("✅ 聚焦子Pipeline创建成功，包含优先级50+的中间件");
     
     println!("✅ 子Pipeline工厂测试通过");

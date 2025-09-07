@@ -10,6 +10,9 @@ pub enum TakeoverError {
     
     #[error("Network interception error: {0}")]
     NetworkInterception(String),
+
+    #[error("tls handshake error: {0}")]
+    Handshake(String),
     
     #[error("Proxy error: {0}")]
     Proxy(String),

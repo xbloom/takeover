@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, Instant};
-use tokio::sync::{RwLock, Mutex, mpsc, oneshot, Notify};
+use tokio::sync::{RwLock, oneshot, Notify};
 use tracing::{info, warn, error, debug, instrument};
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
@@ -772,7 +772,7 @@ impl UserInterventionMiddleware {
     async fn check_auto_approval_rules(
         &self,
         context: &ConnectionContext,
-        intervention_type: &InterventionType,
+        _intervention_typeeee: &InterventionType,
     ) -> Option<InterventionDecision> {
         let mut rules = self.auto_approval_rules.write().await;
         
@@ -798,10 +798,11 @@ impl UserInterventionMiddleware {
     }
     
     /// 应用自动决策
+    #[allow(unused_variables)]
     async fn apply_auto_decision(
         &self,
         intervention_id: InterventionId,
-        decision: InterventionDecision,
+        _decisionn: InterventionDecision,
     ) -> Result<InterventionId, AppError> {
         debug!("Applying auto decision for intervention: {}", intervention_id);
         

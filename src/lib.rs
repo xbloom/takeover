@@ -33,10 +33,29 @@ pub use user_manager::{UserManager, UserSwitcher};
 
 // 新接口（六边形架构）
 pub use core::{AppCore, AppConfig};
-pub use core::ports::*;
-pub use core::model::*;
-pub use core::engine::*;
-pub use core::middleware::*;
-pub use core::services::*;
+// 核心端口接口
+pub use core::ports::{
+    InboundPort, OutboundPort, ControlPort, ApiPort, EventPort, ScriptPort
+};
 
-pub use adapters::*;
+// 核心模型
+pub use core::model::*;
+
+// 核心引擎
+pub use core::engine::*;
+
+// 中间件（避免与adapters的冲突）
+pub use core::middleware::{
+    TlsMiddleware, Http1StreamMiddleware, Http2StreamMiddleware,
+    RuleMatchingMiddleware, HttpModificationMiddleware,
+    ForwardingMiddleware, ResponseMergeMiddleware, UserInterventionMiddleware
+};
+
+// 服务（使用具体导入避免ConnectionState冲突）
+pub use core::services::{StateManager, ReplayManager};
+
+// 适配器
+pub use adapters::{
+    inbound::*, outbound::*, api::*
+};
+// 注意：暂时不导出adapters::script以避免与core::middleware::script冲突

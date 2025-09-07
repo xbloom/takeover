@@ -10,16 +10,15 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use anyhow::Result;
-use futures::StreamExt;
 use tokio::time::timeout;
 
 use takeover::{
     // Level 1: 配置层
     AppConfig, InboundConfig,
     // Level 2: 核心模型
-    Connection, ConnectionContext, AdapterStatus,
+    Connection, ConnectionContext,
     // Level 3: 入站适配器
-    InboundPort, AppError
+    InboundPort
 };
 
 // 我们需要直接导入PfInboundAdapter，但它可能不在公共API中
@@ -63,6 +62,7 @@ async fn test_pf_adapter_with_custom_anchor() -> Result<()> {
 /// 测试入站配置的应用和验证
 #[tokio::test]
 async fn test_inbound_integration() -> Result<()> {
+    use takeover::core::AppError;
     println!("🧪 测试入站配置集成");
     
     // 创建测试配置（Level 1）

@@ -8,14 +8,11 @@ use std::net::SocketAddr;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use uuid::Uuid;
 
 use takeover::{
-    AppConfig, Connection, ConnectionContext, ConnectionMetadata, 
+    Connection, ConnectionContext, ConnectionMetadata, 
     HttpRequest, HttpResponse, ProcessingState, RequestModifications,
-    ConnectionStatus, ConnectionSummary, Rule, RulePattern, RuleAction,
-    ModificationType, RequestModification,
-    DomainEvent, ErrorCategory, ConnectionId, RequestId
+    ConnectionStatus, ConnectionSummary, DomainEvent, ErrorCategory
 };
 
 /// 创建测试用的连接
@@ -230,7 +227,6 @@ async fn test_connection_status_transitions() -> Result<()> {
 async fn test_domain_events() -> Result<()> {
     // 测试领域事件的创建和属性
     let connection_id = takeover::utils::generate_short_connection_id();
-    let request_id = Uuid::new_v4();
     let source_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
     
     // 测试新连接事件

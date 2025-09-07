@@ -215,7 +215,7 @@ async fn demo_connection_status() -> Result<(), Box<dyn std::error::Error>> {
             ConnectionStatus::Error(ref msg) => println!("发生错误: {}", msg),
             ConnectionStatus::Closing => println!("正在关闭连接"),
             ConnectionStatus::Closed => println!("连接已关闭"),
-            _ => println!("其他状态"),
+            // _ => println!("其他状态"),
         }
     }
     

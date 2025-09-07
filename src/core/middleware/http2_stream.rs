@@ -429,7 +429,7 @@ impl Http2StreamMiddleware {
                 Ok(response)
             }
             Err(e) => {
-                error!("❌ HTTP/2流处理失败: stream_id={:?}, error={}", stream_id, e);
+                warn!("❌ HTTP/2流处理失败: stream_id={:?}, error={}", stream_id, e);
                 // 更新失败统计
                 {
                     let mut stats = stats_clone.write().await;
@@ -524,7 +524,7 @@ impl Http2StreamMiddleware {
                 debug!("🎯 业务Pipeline返回: {:?}", other_result);
             }
             Err(e) => {
-                error!("💥 业务Pipeline处理失败: {}", e);
+                warn!("💥 业务Pipeline处理失败: {}", e);
                 return Err(e);
             }
         }

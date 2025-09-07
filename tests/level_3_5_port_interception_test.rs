@@ -5,7 +5,6 @@
 use std::time::Duration;
 use tokio::time::timeout;
 use anyhow::Result;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use futures::StreamExt;

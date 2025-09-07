@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tracing::{warn, error, debug, info, instrument};
+use tracing::{warn, error, debug, instrument};
 use async_trait::async_trait;
 
 use crate::core::engine::{Middleware, MiddlewareResult};
@@ -61,6 +61,7 @@ pub struct TlsMiddlewareConfig {
 struct CachedCertificate {
     certificate: TlsCertificate,
     cached_at: std::time::SystemTime,
+    #[allow(dead_code)]
     hit_count: usize,
 }
 
@@ -298,7 +299,8 @@ impl TlsMiddleware {
     }
     
     /// 执行TLS拦截 - 现代化实现
-    #[instrument(skip(self, context), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context), fields(connection_id = %context.id))]
+    #[instrument(skip(self, context))]
     async fn perform_tls_interception(&self, context: &mut ConnectionContext) -> Result<(), AppError> {
         let domain = &context.target_host;
         let port = context.target_port;
@@ -354,7 +356,7 @@ impl TlsMiddleware {
                 Ok(())
             }
             Err(e) => {
-                error!("❌ TLS拦截失败: {}:{} - {}", domain, port, e);
+                debug!("❌ TLS拦截失败: {}:{} - {}", domain, port, e);
                 
                 // 更新失败统计
                 {
@@ -386,7 +388,7 @@ impl TlsMiddleware {
         
         // 与客户端建立TLS连接
         let client_tls_stream = acceptor.accept(client_stream).await
-            .map_err(|e| AppError::Config(format!("Failed to accept TLS connection: {}", e)))?;
+            .map_err(|e| AppError::Handshake(format!("🔐 Failed to accept TLS connection: {}", e)))?;
         
         // 🌐 获取ALPN协商结果
         let alpn_protocol = client_tls_stream.get_ref().1.alpn_protocol()
@@ -585,7 +587,8 @@ impl Middleware for TlsMiddleware {
         "tls"
     }
     
-    #[instrument(skip(self, context, _core), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context, _core), fields(connection_id = %context.id))]
+    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -637,7 +640,7 @@ impl Middleware for TlsMiddleware {
                 Ok(MiddlewareResult::Continue)
             }
             Err(e) => {
-                error!("❌ TLS interception failed for {}:{}: {}", context.target_host, context.target_port, e);
+                debug!("❌ TLS interception failed for {}:{}: {}", context.target_host, context.target_port, e);
                 
                 self.update_handshake_failure_stats().await;
                 

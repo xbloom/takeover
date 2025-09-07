@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use crate::core::model;
 
 use crate::core::engine::{Middleware, MiddlewareResult};
-use crate::core::model::{ConnectionContext, ProcessingState, HttpRequest, HttpResponse, CompositeRequestConfig};
+use crate::core::model::{ConnectionContext, ProcessingState, HttpResponse, CompositeRequestConfig};
 use crate::core::ports::{ScriptPort, ApiPort, AppError, ScriptInput, ScriptOutput, ScriptAction, TriggerPoint, TriggerCondition};
 
 /// 脚本中间件
@@ -70,7 +70,7 @@ pub struct ScriptTrigger {
 
 /// 脚本执行统计
 #[derive(Debug, Default, Clone)]
-struct ScriptStats {
+pub struct ScriptStats {
     /// 总执行次数
     total_executions: u64,
     /// 成功执行次数
@@ -684,7 +684,7 @@ impl Middleware for ScriptMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::{Connection, ConnectionMetadata, HttpRequest, TriggerPoint, TriggerCondition};
+    use crate::core::model::{Connection, HttpRequest, TriggerPoint, TriggerCondition};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     
     // Mock implementations for testing

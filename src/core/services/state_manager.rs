@@ -131,10 +131,12 @@ pub struct SessionState {
 #[derive(Debug, Clone)]
 struct CacheEntry {
     /// 键
+    #[allow(dead_code)]
     key: String,
     /// 值
     value: serde_json::Value,
     /// 创建时间
+    #[allow(dead_code)]
     created_at: Instant,
     /// 过期时间
     expires_at: Option<Instant>,
@@ -143,6 +145,7 @@ struct CacheEntry {
     /// 最后访问时间
     last_access: Instant,
     /// 标签
+    #[allow(dead_code)]
     tags: Vec<String>,
 }
 
@@ -150,6 +153,7 @@ struct CacheEntry {
 #[derive(Debug, Clone)]
 struct TempDataEntry {
     /// 键
+    #[allow(dead_code)]
     key: String,
     /// 值
     value: serde_json::Value,
@@ -158,6 +162,7 @@ struct TempDataEntry {
     /// 过期时间
     expires_at: Instant,
     /// 所有者
+    #[allow(dead_code)]
     owner: Option<String>,
 }
 

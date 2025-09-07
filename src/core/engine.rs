@@ -89,7 +89,8 @@ impl Pipeline {
     }
     
     /// 执行管道
-    #[instrument(skip(self, context, core), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context, core), fields(connection_id = %context.id))]
+    #[instrument(skip(self, context, core))]
     pub async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -115,7 +116,7 @@ impl Pipeline {
                     return Ok(result);
                 }
                 Err(e) => {
-                    error!("Middleware {} failed: {}", middleware.name(), e);
+                    error!(" ❌ Middleware {} failed: {}", middleware.name(), e);
                     return Err(e);
                 }
             }
@@ -385,13 +386,6 @@ mod tests {
             Self {
                 name: name.into(),
                 test_priority: 50, // 默认优先级
-            }
-        }
-        
-        pub fn with_priority(name: impl Into<String>, priority: i32) -> Self {
-            Self {
-                name: name.into(),
-                test_priority: priority,
             }
         }
     }

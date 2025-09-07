@@ -9,13 +9,12 @@
 //! - 重放历史和统计
 
 use std::sync::Arc;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 use std::path::{Path, PathBuf};
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::RwLock;
 use tokio::fs;
-use tracing::{info, warn, error, debug, instrument};
-use async_trait::async_trait;
+use tracing::{info, warn, debug, instrument};
 use serde::{Serialize, Deserialize};
 use uuid::Uuid;
 
@@ -1468,6 +1467,7 @@ mod tests {
     use super::*;
     use crate::core::model::{Connection, HttpRequest};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use async_trait::async_trait;
     
     // Mock API port for testing
     struct MockApiPort;
