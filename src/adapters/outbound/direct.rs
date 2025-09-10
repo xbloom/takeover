@@ -318,6 +318,12 @@ impl DirectOutboundAdapter {
     /// 
     /// 根据转发中间件设置的协议信息决定
     fn should_use_tls(&self, context: &ConnectionContext) -> bool {
+        // 🔒 Copy Pipe模式：强制使用TCP连接，让客户端直接与服务器进行TLS握手
+        if context.custom_data.get("copy_pipe_mode").and_then(|v| v.as_bool()).unwrap_or(false) {
+            debug!("Copy Pipe模式：强制使用TCP连接 (目标: {}:{})", context.target_host, context.target_port);
+            return false;
+        }
+        
         // 🔍 检查转发中间件设置的原始目标协议
         if let Some(protocol) = context.custom_data.get("original_target_protocol") {
             if let Some(protocol_str) = protocol.as_str() {
@@ -354,11 +360,11 @@ impl DirectOutboundAdapter {
         
         // 3️⃣ 进行TLS握手 
         let domain = target_host.to_string().try_into()
-            .map_err(|e| AppError::Config(format!("Invalid domain name: {}", e)))?;
+            .map_err(|e| AppError::Handshake(format!("Invalid domain name: {}", e)))?;
         
         debug!("🤝 开始TLS握手: {}", target_host);
         let tls_stream = connector.connect(domain, tcp_stream).await
-            .map_err(|e| AppError::Config(format!("TLS handshake failed: {}", e)))?;
+            .map_err(|e| AppError::Handshake(format!("TLS handshake failed: {}", e)))?;
         
         debug!("✅ TLS连接已建立: {}:{}", target_host, target_port);
         Ok(tls_stream)
@@ -392,7 +398,7 @@ impl OutboundPort for DirectOutboundAdapter {
                 }
                 Err(e) => {
                     self.update_failure_stats().await;
-                    warn!("❌ Failed to establish TLS connection: {}", e);
+                    debug!("❌ Failed to establish TLS connection: {}", e);
                     Err(e)
                 }
             }
@@ -416,7 +422,7 @@ impl OutboundPort for DirectOutboundAdapter {
                         remote_addr,
                     };
                     
-                    info!("✅ Direct connection established: {} -> {}", local_addr, remote_addr);
+                    debug!("✅ Direct connection established: {} -> {}", local_addr, remote_addr);
                     Ok(Box::new(network_stream))
                 }
                 Err(e) => {

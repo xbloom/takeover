@@ -230,7 +230,7 @@ impl Http1StreamMiddleware {
         let (request_line, headers) = match tokio::time::timeout(timeout_duration, self.read_headers(&mut reader)).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                error!("❌ 读取HTTP头部失败: {}", e);
+                debug!("❌ 读取HTTP头部失败: {}", e);
                 // 将TLS流放回
                 context.connection.inbound_tls_stream = Some(tls_stream);
                 return Err(e);
@@ -288,7 +288,7 @@ impl Http1StreamMiddleware {
         let (request_line, headers) = match tokio::time::timeout(timeout_duration, self.read_headers(&mut reader)).await {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                error!("❌ 读取HTTP头部失败: {}", e);
+                debug!("❌ 读取HTTP头部失败: {}", e);
                 // 将TCP流放回
                 context.connection.stream = Some(tcp_stream);
                 return Err(e);
@@ -518,7 +518,7 @@ impl Middleware for Http1StreamMiddleware {
             return Ok(MiddlewareResult::Continue);
         }
         
-        info!("🔗 HTTP/1.1连接开始: {}", context.id);
+        debug!("🔗 HTTP/1.1连接开始: {}", context.id);
         
         // 更新处理状态
         context.set_processing_state(ProcessingState::HttpParsing);
@@ -561,7 +561,7 @@ impl Middleware for Http1StreamMiddleware {
                 Ok(MiddlewareResult::Continue)
             }
             Err(e) => {
-                error!("❌ HTTP/1.1请求解析失败: {}", e);
+                debug!("❌ HTTP/1.1请求解析失败: {}", e);
                 
                 self.update_failure_stats().await;
                 self.update_parse_error_stats().await;

@@ -136,20 +136,20 @@ impl ResponseWriteBackMiddleware {
                 Ok(total_bytes)
             }
             Ok(Err(e)) => {
-                error!("HTTPS响应写入失败: {}", e);
+                debug!("HTTPS响应写入失败: {}", e);
                 {
                     let mut stats = self.stats.write().await;
                     stats.failed_writebacks += 1;
                 }
-                Err(TakeoverError::Config(format!("Failed to write HTTPS response: {}", e)))
+                Err(TakeoverError::Stream(format!("Failed to write HTTPS response: {}", e)))
             }
             Err(_) => {
-                error!("HTTPS响应写入超时");
+                debug!("HTTPS响应写入超时");
                 {
                     let mut stats = self.stats.write().await;
                     stats.write_timeouts += 1;
                 }
-                Err(TakeoverError::Config("HTTPS response write timeout".to_string()))
+                Err(TakeoverError::Stream("HTTPS response write timeout".to_string()))
             }
         }
     }
@@ -226,9 +226,25 @@ impl ResponseWriteBackMiddleware {
         // 响应头部
         let mut headers = response.headers.clone();
         
+        // 🔧 RFC 7230修复：检查Transfer-Encoding和Content-Length头部冲突
+        let has_transfer_encoding = headers.keys()
+            .any(|key| key.to_lowercase() == "transfer-encoding");
+        let has_content_length = headers.keys()
+            .any(|key| key.to_lowercase() == "content-length");
+        
         // 自动添加必要的头部
-        if !headers.contains_key("content-length") {
+        if !has_content_length && !has_transfer_encoding {
+            // 只有在没有Transfer-Encoding时才添加Content-Length
             headers.insert("content-length".to_string(), response.body.len().to_string());
+            debug!("自动添加Content-Length头部: {}", response.body.len());
+        } else if has_transfer_encoding && has_content_length {
+            // RFC 7230违规：同时存在两个头部，移除Content-Length
+            warn!("⚠️ RFC 7230违规：同时存在Transfer-Encoding和Content-Length，移除Content-Length");
+            headers.retain(|key, _| key.to_lowercase() != "content-length");
+        } else if has_transfer_encoding {
+            debug!("检测到Transfer-Encoding头部，跳过Content-Length自动添加");
+        } else if has_content_length {
+            debug!("已存在Content-Length头部，跳过自动添加");
         }
         
         if self.config.add_server_header && !headers.contains_key("server") {
@@ -261,8 +277,20 @@ impl ResponseWriteBackMiddleware {
         // 头部结束标记
         response_data.extend_from_slice(b"\r\n");
         
-        // 响应体
-        response_data.extend_from_slice(&response.body);
+        // 🔧 响应体处理：检查是否需要chunked编码
+        let is_chunked = headers.keys()
+            .any(|key| key.to_lowercase() == "transfer-encoding" && 
+                      headers.get(key).map(|v| v.to_lowercase().contains("chunked")).unwrap_or(false));
+        
+        if is_chunked {
+            // ✅ Chunked编码响应体
+            debug!("使用chunked编码发送响应体: {} bytes", response.body.len());
+            self.append_chunked_body(&mut response_data, &response.body);
+        } else {
+            // ✅ 普通响应体
+            debug!("直接发送响应体: {} bytes", response.body.len());
+            response_data.extend_from_slice(&response.body);
+        }
         
         debug!("格式化HTTP响应完成: {} bytes (头部: {} bytes, 体: {} bytes)", 
                response_data.len(), 
@@ -299,6 +327,37 @@ impl ResponseWriteBackMiddleware {
     fn format_http_date(&self) -> String {
         // 简化实现，实际应使用RFC 2822格式
         chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+    }
+    
+    /// 按chunked编码格式追加响应体
+    /// 
+    /// Chunked编码格式：
+    /// 1. chunk-size (十六进制) + CRLF
+    /// 2. chunk-data + CRLF
+    /// 3. 最后：0 + CRLF + CRLF
+    fn append_chunked_body(&self, response_data: &mut Vec<u8>, body: &[u8]) {
+        if body.is_empty() {
+            // 空body，只发送结束chunk
+            response_data.extend_from_slice(b"0\r\n\r\n");
+            debug!("发送空chunked响应体");
+            return;
+        }
+        
+        // 🔧 目前简化实现：将整个body作为单个chunk发送
+        // 生产环境可能需要分块发送大响应
+        let chunk_size = format!("{:x}\r\n", body.len());
+        
+        // 1. 写入chunk大小（十六进制）
+        response_data.extend_from_slice(chunk_size.as_bytes());
+        
+        // 2. 写入chunk数据
+        response_data.extend_from_slice(body);
+        response_data.extend_from_slice(b"\r\n");
+        
+        // 3. 写入结束chunk (0 + CRLF + CRLF)
+        response_data.extend_from_slice(b"0\r\n\r\n");
+        
+        debug!("发送chunked响应体: 1个chunk，{} bytes", body.len());
     }
     
     /// 更新总响应统计
@@ -431,8 +490,9 @@ impl Middleware for ResponseWriteBackMiddleware {
                     }
                     _ => unreachable!()
                 };
-                
-                info!("✅ HTTP/1.1响应写回完成: {} bytes (连接: {})", bytes_written, context.id);
+                if let Some(req) = &context.request{
+                    info!("✅ HTTP/1.1处理成功: {} bytes ({}: {})", bytes_written, req.method, req.url);
+                }
                 
                 // Keep-alive处理
                 if self.config.enable_keep_alive {
@@ -543,5 +603,52 @@ mod tests {
         assert_eq!(updated_stats.keep_alive_connections, 1);
         
         println!("✅ 统计跟踪测试通过");
+    }
+    
+    #[test]
+    fn test_chunked_encoding_support() {
+        let middleware = ResponseWriteBackMiddleware::new();
+        
+        // 测试1：Transfer-Encoding: chunked应该使用chunked格式
+        let mut response1 = HttpResponse::new(200);
+        response1.headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+        response1.body = b"Hello, World!".to_vec();
+        
+        let formatted1 = middleware.format_http_response(&response1).unwrap();
+        let response_str1 = String::from_utf8_lossy(&formatted1);
+        
+        // 验证chunked编码格式
+        assert!(response_str1.contains("transfer-encoding: chunked"));
+        assert!(!response_str1.contains("content-length"));
+        // 验证chunk大小（13的十六进制是d）
+        assert!(response_str1.contains("d\r\n"));
+        // 验证数据和结束标记
+        assert!(response_str1.contains("Hello, World!\r\n0\r\n\r\n"));
+        
+        // 测试2：空body的chunked编码
+        let mut response2 = HttpResponse::new(200);
+        response2.headers.insert("Transfer-Encoding".to_string(), "chunked".to_string());
+        response2.body = Vec::new();
+        
+        let formatted2 = middleware.format_http_response(&response2).unwrap();
+        let response_str2 = String::from_utf8_lossy(&formatted2);
+        
+        // 空body应该只有结束chunk
+        assert!(response_str2.ends_with("0\r\n\r\n"));
+        
+        // 测试3：普通响应不应该使用chunked编码
+        let mut response3 = HttpResponse::new(200);
+        response3.body = b"Hello, World!".to_vec();
+        
+        let formatted3 = middleware.format_http_response(&response3).unwrap();
+        let response_str3 = String::from_utf8_lossy(&formatted3);
+        
+        // 普通响应应该有content-length，不应该有chunked标记
+        assert!(response_str3.contains("content-length: 13"));
+        assert!(!response_str3.contains("transfer-encoding"));
+        assert!(!response_str3.contains("d\r\n")); // 没有chunk大小标记
+        assert!(response_str3.ends_with("Hello, World!")); // 直接结束，没有chunked标记
+        
+        println!("✅ Chunked编码支持测试通过");
     }
 }

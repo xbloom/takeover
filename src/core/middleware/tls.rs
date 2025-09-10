@@ -299,7 +299,7 @@ impl TlsMiddleware {
     }
     
     /// 执行TLS拦截 - 现代化实现
-    // #[instrument(skip(self, context), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context), fields(conn = %context.id))]
     #[instrument(skip(self, context))]
     async fn perform_tls_interception(&self, context: &mut ConnectionContext) -> Result<(), AppError> {
         let domain = &context.target_host;
@@ -587,7 +587,7 @@ impl Middleware for TlsMiddleware {
         "tls"
     }
     
-    // #[instrument(skip(self, context, _core), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context, _core), fields(conn = %context.id))]
     #[instrument(skip(self, context, _core))]
     async fn process(
         &self,

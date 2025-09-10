@@ -16,7 +16,8 @@ use crate::core::ports::{InboundPort, InboundConfig, AdapterStatus, AppError};
 use crate::core::model::{Connection, ConnectionMetadata};
 use crate::transparent_proxy_manager::TransparentProxyManager;
 use crate::protocol_handler::TransparentConnectionParser;
-
+use crate::components::process_finder::{ProcessFinder, ProcessInfo};
+ 
 /// macOS pfctl入站适配器
 /// 
 /// 负责：
@@ -37,6 +38,8 @@ pub struct PfInboundAdapter {
     connection_count: Arc<RwLock<usize>>,
     /// 连接发送通道
     connection_sender: Arc<RwLock<Option<mpsc::UnboundedSender<Result<Connection, AppError>>>>>,
+    /// 进程查询组件
+    process_finder: ProcessFinder,
 }
 
 impl PfInboundAdapter {
@@ -55,6 +58,7 @@ impl PfInboundAdapter {
             })),
             connection_count: Arc::new(RwLock::new(0)),
             connection_sender: Arc::new(RwLock::new(None)),
+            process_finder: ProcessFinder::new(),
         }
     }
     
@@ -73,6 +77,7 @@ impl PfInboundAdapter {
             })),
             connection_count: Arc::new(RwLock::new(0)),
             connection_sender: Arc::new(RwLock::new(None)),
+            process_finder: ProcessFinder::new(),
         }
     }
     
@@ -137,7 +142,7 @@ impl PfInboundAdapter {
     
     /// 从TCP流创建Connection
     async fn create_connection_from_stream(&self, stream: TcpStream) -> Result<Connection, AppError> {
-        let source_addr = stream.peer_addr()
+        let source_addr: SocketAddr = stream.peer_addr()
             .map_err(|e| AppError::Config(format!("Failed to get source address: {}", e)))?;
         
         // 获取进程信息（如果可能）
@@ -223,11 +228,26 @@ impl PfInboundAdapter {
     }
     
     /// 获取进程信息
-    async fn get_process_info(&self, _source_addr: &SocketAddr) -> ProcessInfo {
-        // 简化实现，实际应该通过系统调用获取进程信息
-        ProcessInfo {
-            process_name: None,
-            user_id: None,
+    async fn get_process_info(&self, source_addr: &SocketAddr) -> ProcessInfo {
+        debug!("正在查询连接{}的进程信息", source_addr);
+        
+        match self.process_finder.find_process(*source_addr).await {
+            Ok(process_info) => {
+                debug!("成功获取进程信息: PID={:?}, 名称={:?}, 用户ID={:?}", 
+                       process_info.pid, process_info.process_name, process_info.user_id);
+                process_info
+            }
+            Err(e) => {
+                debug!("进程查询失败: {}", e);
+                // 返回默认的空信息
+                ProcessInfo {
+                    pid: None,
+                    process_name: None,
+                    executable_path: None,
+                    user_id: None,
+                    timestamp: std::time::SystemTime::now(),
+                }
+            }
         }
     }
     
@@ -324,14 +344,6 @@ impl PfInboundAdapter {
     }
 }
 
-/// 进程信息结构
-#[derive(Debug, Default)]
-struct ProcessInfo {
-    process_name: Option<String>,
-    #[allow(dead_code)]
-    user_id: Option<u32>,
-}
-
 #[async_trait]
 impl InboundPort for PfInboundAdapter {
     #[instrument(skip(self, config))]
@@ -426,6 +438,7 @@ impl Clone for PfInboundAdapter {
             status: Arc::clone(&self.status),
             connection_count: Arc::clone(&self.connection_count),
             connection_sender: Arc::clone(&self.connection_sender),
+            process_finder: ProcessFinder::new(), // ProcessFinder 创建新实例
         }
     }
 }
@@ -459,11 +472,5 @@ mod tests {
         assert_eq!(status.name, "pfctl(test_anchor)");
     }
     
-    #[test]
-    fn test_process_info_default() {
-        let process_info = ProcessInfo::default();
-        assert!(process_info.process_name.is_none());
-        assert!(process_info.user_id.is_none());
-    }
 }
 

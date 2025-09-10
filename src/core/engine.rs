@@ -89,7 +89,7 @@ impl Pipeline {
     }
     
     /// 执行管道
-    // #[instrument(skip(self, context, core), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context, core), fields(conn = %context.id))]
     #[instrument(skip(self, context, core))]
     pub async fn process(
         &self,
@@ -116,7 +116,7 @@ impl Pipeline {
                     return Ok(result);
                 }
                 Err(e) => {
-                    error!(" ❌ Middleware {} failed: {}", middleware.name(), e);
+                    debug!(" ❌ Middleware {} failed: {}", middleware.name(), e);
                     return Err(e);
                 }
             }
@@ -297,6 +297,9 @@ impl ProcessingEngine {
         vec![
             // 🔍 协议检测中间件 (优先级5) - 最早执行，协议分流
             Arc::new(middleware::protocol_detection::ProtocolDetectionMiddleware::new()),
+            
+            // 🔎 进程信息查询中间件 (优先级8) - 查询连接对应的进程信息
+            // Arc::new(middleware::process_info::ProcessInfoMiddleware::new()),
             
             // 🔐 TLS中间件 (优先级10) - 处理HTTPS拦截和ALPN协商
             Arc::new(middleware::tls::TlsMiddleware::with_config(

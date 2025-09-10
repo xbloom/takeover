@@ -337,6 +337,8 @@ pub enum ProcessingState {
     Processing,
     /// 协议检测中
     ProtocolDetection,
+    /// 进程信息查询
+    ProcessInfoQuery,
     /// TLS处理
     TlsHandshake,
     /// HTTP解析

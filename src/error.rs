@@ -16,6 +16,9 @@ pub enum TakeoverError {
     
     #[error("Proxy error: {0}")]
     Proxy(String),
+
+    #[error("Stream read/write: {0}")]
+    Stream(String),
     
     #[error("Script error: {0}")]
     Script(String),

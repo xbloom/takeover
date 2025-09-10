@@ -111,7 +111,7 @@ impl Http2StreamMiddleware {
     /// 处理HTTPS + HTTP/2连接 - 现代化实现
     /// 
     /// 现在使用具体的rustls-tokio类型，完全兼容tokio::io traits
-    #[instrument(skip(client_tls_stream, connection_context, core, stats), fields(connection_id = %connection_context.id))]
+    #[instrument(skip(client_tls_stream, connection_context, core, stats), fields(conn = %connection_context.id))]
     pub async fn handle_https_connection(
         config: Http2Config,
         client_tls_stream: InboundTlsStream<TcpStream>,
@@ -174,7 +174,7 @@ impl Http2StreamMiddleware {
     }
     
     /// 处理单个HTTP/2流 - 静态方法
-    #[instrument(skip(req, core, stats), fields(connection_id = %connection_context.id))]
+    #[instrument(skip(req, core, stats), fields(conn = %connection_context.id))]
     async fn handle_http2_stream_static(
         req: Request<Incoming>,
         connection_context: ConnectionContext,
@@ -298,7 +298,6 @@ impl Http2StreamMiddleware {
     /// 
     /// 这是复杂Pipeline的核心：父Pipeline在这里进入长期监听状态，
     /// 为每个HTTP/2流动态spawn子Pipeline
-    #[instrument(skip(self, tls_stream, parent_context, core), fields(connection_id = %parent_context.id))]
     async fn start_http2_connection(
         &self,
         tls_stream: InboundTlsStream<TcpStream>,
@@ -362,6 +361,13 @@ impl Http2StreamMiddleware {
     /// 静态方法：为HTTP/2流spawn子Pipeline
     /// 
     /// 这是复杂Pipeline分裂的核心实现
+    #[instrument(
+        skip(req, parent_context, core, stats), 
+        fields(
+            conn = %parent_context.id, 
+            proc = parent_context.connection.metadata.process_name
+        )
+    )]
     async fn spawn_child_pipeline_static(
         req: Request<Incoming>,
         parent_context: ConnectionContext,
@@ -379,7 +385,7 @@ impl Http2StreamMiddleware {
         let uri = req.uri().clone();
         let stream_id = Self::extract_stream_id_static(&req);
         
-        info!("🌊 HTTP/2请求: {} {} (流ID: {:?})", method, uri, stream_id);
+        debug!("🌊 HTTP/2请求: {} {} (流ID: {:?})", method, uri, stream_id);
         
         // 转换hyper请求为我们的HttpRequest
         let http_request = match Self::convert_hyper_request_static(req).await {
@@ -417,7 +423,7 @@ impl Http2StreamMiddleware {
         let stats_clone = Arc::clone(&stats);
         match Self::continue_standard_pipeline(stream_context, core).await {
             Ok(response) => {
-                debug!("HTTP/2流处理成功: stream_id={:?}", stream_id);
+                info!("HTTP/2流处理成功: {} {}  (流ID: {:?})", method, uri, stream_id);
                 // 更新成功统计
                 {
                     let mut stats = stats_clone.write().await;
@@ -429,7 +435,7 @@ impl Http2StreamMiddleware {
                 Ok(response)
             }
             Err(e) => {
-                warn!("❌ HTTP/2流处理失败: stream_id={:?}, error={}", stream_id, e);
+                warn!("💥 HTTP/2流处理失败: {} {}  (流ID: {:?}, error={})", method, uri, stream_id, e);
                 // 更新失败统计
                 {
                     let mut stats = stats_clone.write().await;
@@ -524,7 +530,7 @@ impl Http2StreamMiddleware {
                 debug!("🎯 业务Pipeline返回: {:?}", other_result);
             }
             Err(e) => {
-                warn!("💥 业务Pipeline处理失败: {}", e);
+                debug!("💥 业务Pipeline处理失败: {}", e);
                 return Err(e);
             }
         }
@@ -647,7 +653,7 @@ impl Middleware for Http2StreamMiddleware {
         "http2_stream"
     }
     
-    #[instrument(skip(self, context, _core), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context, _core), fields(conn = %context.id))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -661,7 +667,7 @@ impl Middleware for Http2StreamMiddleware {
             return Ok(MiddlewareResult::Continue);
         }
         
-        info!("🔗 HTTP/2连接开始: {}", context.id);
+        debug!("🔗 HTTP/2连接开始: {}", context.id);
         
         // 更新处理状态
         context.set_processing_state(ProcessingState::HttpParsing);

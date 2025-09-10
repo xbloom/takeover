@@ -16,6 +16,7 @@ pub mod user_manager;
 // 新架构模块
 pub mod core;
 pub mod adapters;
+pub mod components;
 
 // 重新导出主要的公共接口
 

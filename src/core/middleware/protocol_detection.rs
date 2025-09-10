@@ -39,6 +39,10 @@ pub struct ProtocolDetectionConfig {
     pub enable_copy_pipe: bool,
     /// Copy Pipe缓冲区大小
     pub copy_pipe_buffer_size: usize,
+    /// 是否启用进程名检测
+    pub enable_process_detection: bool,
+    /// SSL Pinning进程白名单（这些进程直接透传）
+    pub ssl_pinning_processes: Vec<String>,
 }
 
 /// 协议检测统计信息
@@ -58,6 +62,10 @@ pub struct ProtocolDetectionStats {
     unknown_protocol_connections: u64,
     /// Copy Pipe透传连接数
     copy_pipe_connections: u64,
+    /// SSL Pinning进程透传数
+    ssl_pinning_bypassed: u64,
+    /// 进程检测失败数
+    process_detection_failures: u64,
     /// 检测失败数
     detection_failures: u64,
 }
@@ -200,6 +208,63 @@ impl ProtocolDetectionMiddleware {
         }
     }
     
+    /// 检测进程是否使用SSL Pinning
+    /// 
+    /// 检查进程名是否在SSL Pinning白名单中，如果是则应该直接透传
+    #[instrument(skip(self, context))]
+    fn is_ssl_pinning_process(&self, context: &ConnectionContext) -> bool {
+        if !self.config.enable_process_detection {
+            return false;
+        }
+        
+        // 从connection.metadata中获取进程名（无需重新查询）
+        if let Some(process_name) = &context.connection.metadata.process_name {
+            debug!("检测进程名: {} (来源: {})", process_name, context.connection.source_addr);
+            
+            // 检查是否在SSL Pinning白名单中
+            let is_pinning_process = self.config.ssl_pinning_processes.iter()
+                .any(|pattern| self.process_name_matches(process_name, pattern));
+            
+            if is_pinning_process {
+                info!("🔒 检测到SSL Pinning进程: {} (来源: {}), 启用Copy Pipe透传", 
+                      process_name, context.connection.source_addr);
+                return true;
+            } else {
+                debug!("进程{}不在SSL Pinning白名单中", process_name);
+            }
+        } else {
+            debug!("连接{}无法获取进程名", context.connection.source_addr);
+        }
+        
+        false
+    }
+    
+    /// 检查进程名是否匹配模式
+    fn process_name_matches(&self, process_name: &str, pattern: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+        
+        // 支持精确匹配和通配符匹配
+        if pattern.contains('*') {
+            // 简单的通配符匹配
+            if pattern.starts_with('*') && pattern.ends_with('*') {
+                let middle = &pattern[1..pattern.len()-1];
+                process_name.contains(middle)
+            } else if pattern.starts_with('*') {
+                let suffix = &pattern[1..];
+                process_name.ends_with(suffix)
+            } else if pattern.ends_with('*') {
+                let prefix = &pattern[..pattern.len()-1];
+                process_name.starts_with(prefix)
+            } else {
+                process_name == pattern
+            }
+        } else {
+            process_name == pattern
+        }
+    }
+    
     /// 检测TLS握手包
     /// 
     /// TLS握手特征:
@@ -287,7 +352,7 @@ impl ProtocolDetectionMiddleware {
         context: &ConnectionContext,
         core: &crate::core::AppCore,
     ) -> Result<(), TakeoverError> {
-        info!("🔗 启动Copy Pipe透传: {}:{}", context.target_host, context.target_port);
+        debug!("🔗 启动Copy Pipe透传: {}:{}", context.target_host, context.target_port);
         
         // 连接到目标服务器
         let server_stream = self.connect_to_target(context, core).await?;
@@ -322,7 +387,7 @@ impl ProtocolDetectionMiddleware {
     }
     
     /// 双向数据拷贝
-    #[instrument(skip(self, client_stream, server_stream))]
+    #[instrument(skip(self, client_stream, server_stream, context))]
     async fn bidirectional_copy(
         &self,
         mut client_stream: TcpStream,
@@ -330,7 +395,7 @@ impl ProtocolDetectionMiddleware {
         context: &ConnectionContext,
     ) -> Result<(), TakeoverError> {
         let connection_id = context.id.clone();
-        info!("开始双向数据转发: {}", connection_id);
+        debug!("开始双向数据转发: {}", connection_id);
         
         let (mut client_read, mut client_write) = client_stream.split();
         let (server_read, server_write) = tokio::io::split(server_stream);
@@ -394,8 +459,8 @@ impl ProtocolDetectionMiddleware {
         // 等待任一方向完成
         let (c2s_bytes, s2c_bytes) = tokio::join!(c2s_task, s2c_task);
         
-        info!("Copy Pipe完成: {}→{} bytes, {}←{} bytes (连接: {})", 
-              c2s_bytes, s2c_bytes, c2s_bytes, s2c_bytes, connection_id);
+        info!("链接Pipe处理成功: {}→{} bytes, (连接| {}:{})", 
+              c2s_bytes, s2c_bytes, context.target_host, context.target_port);
         
         Ok(())
     }
@@ -426,6 +491,16 @@ impl ProtocolDetectionMiddleware {
     pub async fn get_stats(&self) -> ProtocolDetectionStats {
         self.stats.read().await.clone()
     }
+    
+    /// 获取SSL Pinning绕过统计
+    pub async fn get_ssl_pinning_bypassed_count(&self) -> u64 {
+        self.stats.read().await.ssl_pinning_bypassed
+    }
+    
+    /// 获取进程检测失败统计
+    pub async fn get_process_detection_failures_count(&self) -> u64 {
+        self.stats.read().await.process_detection_failures
+    }
 }
 
 impl Default for ProtocolDetectionMiddleware {
@@ -434,15 +509,48 @@ impl Default for ProtocolDetectionMiddleware {
     }
 }
 
-impl Default for ProtocolDetectionConfig {
-    fn default() -> Self {
+impl From<&[&str]> for ProtocolDetectionConfig {
+    fn from(ssl_processes: &[&str]) -> Self {
         Self {
             enabled: true,
             peek_buffer_size: 1024,
             detection_timeout: std::time::Duration::from_secs(5),
             enable_copy_pipe: true,
             copy_pipe_buffer_size: 8192,
+            enable_process_detection: true,
+            ssl_pinning_processes: ssl_processes.iter().map(|s| s.to_string()).collect(),
         }
+    }
+}
+
+impl Default for ProtocolDetectionConfig {
+    fn default() -> Self {
+        const DEFAULT_SSL_PINNING_PROCESSES: &[&str] = &[
+            "nsurlsessiond",          // macOS网络会话守护进程
+            
+            "App Store",
+            "amsengagementd",         // Apple Media Services engagement
+            "amsaccountsd",
+            "appstoreagent",
+
+            "trustd",                 // macOS信任评估守护进程  
+            // "cfprefsd",              // CoreFoundation偏好设置守护进程
+            "cloudd",                 // iCloud守护进程
+            // "CalendarAgent",         // 日历代理
+            // "ContactsAgent",         // 通讯录代理
+            // "accountsd",             // 账户守护进程
+            // "secd",                  // 安全守护进程
+            "itunesstored",           // iTunes Store守护进程
+            "AppleIDAuthAgent",       // Apple ID认证代理
+            // "com.apple.WebKit*",     // WebKit相关进程
+            // "com.apple.Safari*",     // Safari相关进程
+            "mobileassetd",           // 移动资产守护进程
+            "swcd",                   // 软件配置守护进程
+            // "diagnostics_agent",     // 诊断代理
+            // "SystemUIServer",        // 系统UI服务器
+        ];
+        
+        Self::from(DEFAULT_SSL_PINNING_PROCESSES)
     }
 }
 
@@ -468,7 +576,48 @@ impl Middleware for ProtocolDetectionMiddleware {
         // 更新处理状态
         context.set_processing_state(ProcessingState::ProtocolDetection);
         
-        // 检查是否有TCP流可用
+        // 🔒 第一步：检查SSL Pinning进程
+        if self.is_ssl_pinning_process(context) {
+            debug!("🔒 检测到SSL Pinning进程，直接启动Copy Pipe透传");
+            
+            if !self.config.enable_copy_pipe {
+                warn!("Copy Pipe已禁用，拒绝SSL Pinning进程连接");
+                return Err(TakeoverError::Config("Copy pipe disabled for SSL pinning processes".to_string()));
+            }
+            
+            // 更新统计
+            {
+                let mut stats = self.stats.write().await;
+                stats.ssl_pinning_bypassed += 1;
+                stats.copy_pipe_connections += 1;
+                stats.total_connections += 1;
+            }
+            
+            // 存储进程透传信息
+            context.custom_data.insert(
+                "ssl_pinning_process".to_string(),
+                serde_json::json!(true)
+            );
+            context.custom_data.insert(
+                "copy_pipe_mode".to_string(),
+                serde_json::json!(true)
+            );
+            context.custom_data.insert(
+                "bypass_reason".to_string(),
+                serde_json::json!("ssl_pinning_process")
+            );
+            
+            // 取出TCP流，启动Copy Pipe
+            let client_stream = context.connection.stream.take()
+                .ok_or_else(|| TakeoverError::Config("TCP stream not available".to_string()))?;
+            
+            self.start_copy_pipe(client_stream, context, core).await?;
+            
+            // Copy Pipe接管连接，停止后续中间件处理
+            return Ok(MiddlewareResult::Stop);
+        }
+        
+        // 第二步：常规协议检测
         let tcp_stream = match context.connection.stream.as_ref() {
             Some(stream) => stream,
             None => {
@@ -524,6 +673,10 @@ impl Middleware for ProtocolDetectionMiddleware {
                 context.custom_data.insert(
                     "copy_pipe_mode".to_string(),
                     serde_json::json!(true)
+                );
+                context.custom_data.insert(
+                    "bypass_reason".to_string(),
+                    serde_json::json!("non_http_protocol")
                 );
                 
                 // 取出TCP流，启动Copy Pipe

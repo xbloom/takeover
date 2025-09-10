@@ -630,7 +630,7 @@ impl Middleware for ForwardingMiddleware {
         "forwarding"
     }
     
-    // #[instrument(skip(self, context, core), fields(connection_id = %context.id))]
+    // #[instrument(skip(self, context, core), fields(conn = %context.id))]
     #[instrument(skip(self, context, core))]
     async fn process(
         &self,
@@ -668,7 +668,7 @@ impl Middleware for ForwardingMiddleware {
                 Ok(MiddlewareResult::Continue)
             }
             Err(e) => {
-                warn!("⚠️ 转发失败: {} - {}", context.id, e);
+                debug!("⚠️ 转发失败: {} - {}", context.id, e);
                 // 记录错误
                 core.record_error().await;
                 

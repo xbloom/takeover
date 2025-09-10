@@ -462,7 +462,13 @@ impl AppCore {
     }
     
     /// 处理连接的完整生命周期
-    #[instrument(skip(self, context), fields(connection_id = %context.id))]
+    #[instrument(
+        skip(self, context), 
+        fields(
+            conn = %context.id, 
+            proc = context.connection.metadata.process_name
+        )
+    )]
     async fn handle_connection_lifecycle(&self, mut context: ConnectionContext) -> Result<(), TakeoverError> {
         let conn_id = context.id.clone();
         
@@ -586,10 +592,14 @@ impl AppCore {
         let timeout = self.config.general.connection_timeout;
         let now = Instant::now();
         let mut expired_connections = Vec::new();
+        let mut total = 0;
+        let mut expired=0;
         
         {
             let connections = self.active_connections.read().await;
+            
             for (conn_id, tracker) in connections.iter() {
+                total +=1;
                 if now.duration_since(tracker.last_activity) > timeout {
                     expired_connections.push(conn_id.clone());
                 }
@@ -597,9 +607,14 @@ impl AppCore {
         }
         
         for conn_id in expired_connections {
-            warn!("Connection {} expired, cleaning up", conn_id);
+            expired +=1;
+            debug!("Connection {} expired, cleaning up", conn_id);
             self.cleanup_connection(conn_id).await;
         }
+        if expired > 0{
+            info!(" 共{}连接，清理:{}", total, expired );
+        }
+
     }
     
     /// 检查是否正在运行

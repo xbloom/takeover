@@ -3,6 +3,7 @@
 //! 包含所有处理管道中的中间件实现
 
 pub mod protocol_detection; // 协议检测中间件
+pub mod process_info;      // 进程信息查询中间件
 pub mod tls;
 // pub mod http_parsing;  //已经废弃
 pub mod http1_stream;  // 新的HTTP/1.1流中间件
@@ -17,6 +18,7 @@ pub mod response_writeback; // 响应写回中间件
 
 // 重新导出主要的中间件
 pub use protocol_detection::ProtocolDetectionMiddleware; // 协议检测中间件
+pub use process_info::ProcessInfoMiddleware;           // 进程信息查询中间件
 pub use tls::TlsMiddleware;
 // pub use http_parsing::HttpParsingMiddleware; //已经废弃
 pub use http1_stream::Http1StreamMiddleware;  // 新的HTTP/1.1流中间件
