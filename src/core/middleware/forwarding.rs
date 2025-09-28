@@ -1,10 +1,10 @@
-//! 转发中间件
+//! 出站请求中间件
 //! 
 //! 这是透明代理的核心组件，负责：
-//! - 将解析后的HTTP请求转发到目标服务器
-//! - 通过OutboundPort进行实际的网络连接
-//! - 处理响应并返回给客户端
-//! - 管理连接池和重试逻辑
+//! - 通过OutboundPort向目标服务器发送HTTP请求
+//! - 从目标服务器接收HTTP响应
+//! - 管理OutBound连接的重试和错误处理
+//! - 统计OutBound通信性能
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,20 +17,20 @@ use crate::core::model::{ConnectionContext, ProcessingState, HttpRequest, HttpRe
 use crate::core::ports::OutboundPort;
 use crate::error::TakeoverError;
 
-/// 转发中间件
+/// 出站请求中间件
 /// 
-/// 负责实际的请求转发逻辑，是透明代理的核心
-pub struct ForwardingMiddleware {
+/// 负责实际的OutBound请求处理逻辑，是透明代理的核心
+pub struct OutboundRequestMiddleware {
     /// 配置
-    config: ForwardingConfig,
+    config: OutboundRequestConfig,
     /// 统计信息
-    stats: Arc<tokio::sync::RwLock<ForwardingStats>>,
+    stats: Arc<tokio::sync::RwLock<OutboundRequestStats>>,
 }
 
-/// 转发配置
+/// 出站请求配置
 #[derive(Debug, Clone)]
-pub struct ForwardingConfig {
-    /// 是否启用转发
+pub struct OutboundRequestConfig {
+    /// 是否启用出站请求处理
     pub enabled: bool,
     /// 连接超时
     pub connect_timeout: Duration,
@@ -60,9 +60,9 @@ pub enum Protocol {
     Auto, // 根据端口或URL自动检测
 }
 
-/// 转发统计信息
+/// 出站请求统计信息
 #[derive(Debug, Default, Clone)]
-pub struct ForwardingStats {
+pub struct OutboundRequestStats {
     /// 总请求数
     pub total_requests: u64,
     /// 成功转发数
@@ -79,20 +79,20 @@ pub struct ForwardingStats {
     pub active_forwards: u64,
 }
 
-impl ForwardingMiddleware {
-    /// 创建新的转发中间件
+impl OutboundRequestMiddleware {
+    /// 创建新的出站请求中间件
     pub fn new() -> Self {
         Self {
-            config: ForwardingConfig::default(),
-            stats: Arc::new(tokio::sync::RwLock::new(ForwardingStats::default())),
+            config: OutboundRequestConfig::default(),
+            stats: Arc::new(tokio::sync::RwLock::new(OutboundRequestStats::default())),
         }
     }
     
     /// 使用配置创建中间件
-    pub fn with_config(config: ForwardingConfig) -> Self {
+    pub fn with_config(config: OutboundRequestConfig) -> Self {
         Self {
             config,
-            stats: Arc::new(tokio::sync::RwLock::new(ForwardingStats::default())),
+            stats: Arc::new(tokio::sync::RwLock::new(OutboundRequestStats::default())),
         }
     }
     
@@ -596,18 +596,18 @@ impl ForwardingMiddleware {
     }
     
     /// 获取统计信息
-    pub async fn get_stats(&self) -> ForwardingStats {
+    pub async fn get_stats(&self) -> OutboundRequestStats {
         self.stats.read().await.clone()
     }
 }
 
-impl Default for ForwardingMiddleware {
+impl Default for OutboundRequestMiddleware {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Default for ForwardingConfig {
+impl Default for OutboundRequestConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -625,9 +625,9 @@ impl Default for ForwardingConfig {
 }
 
 #[async_trait]
-impl Middleware for ForwardingMiddleware {
+impl Middleware for OutboundRequestMiddleware {
     fn name(&self) -> &str {
-        "forwarding"
+        "outbound_request"
     }
     
     // #[instrument(skip(self, context, core), fields(conn = %context.id))]
@@ -638,11 +638,11 @@ impl Middleware for ForwardingMiddleware {
         core: &crate::core::AppCore,
     ) -> Result<MiddlewareResult, TakeoverError> {
         if !self.config.enabled {
-            debug!("转发中间件已禁用，跳过处理");
+            debug!("出站请求中间件已禁用，跳过处理");
             return Ok(MiddlewareResult::Continue);
         }
         
-        debug!("转发中间件开始处理");
+        debug!("出站请求中间件开始处理");
         
         // 更新处理状态
         context.set_processing_state(ProcessingState::Forwarding);

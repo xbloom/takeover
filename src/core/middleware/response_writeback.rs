@@ -1,9 +1,9 @@
-//! 响应写回中间件
+//! 入站响应中间件
 //! 
 //! 统一输出架构的关键组件，负责：
 //! - 检测协议类型（HTTP/1.1 vs HTTP/2）
-//! - 统一HTTP/1.1响应写回处理
-//! - 处理连接生命周期和keep-alive
+//! - 统一HTTP/1.1响应写回给客户端
+//! - 处理InBound连接生命周期和keep-alive
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,19 +15,19 @@ use crate::core::engine::{Middleware, MiddlewareResult};
 use crate::core::model::{ConnectionContext, ProcessingState, HttpResponse};
 use crate::error::TakeoverError;
 
-/// 响应写回中间件
+/// 入站响应中间件
 /// 
-/// 负责统一的HTTP响应输出处理
-pub struct ResponseWriteBackMiddleware {
+/// 负责统一的HTTP响应输出给客户端的处理
+pub struct InboundResponseMiddleware {
     /// 配置
-    config: ResponseWriteBackConfig,
+    config: InboundResponseConfig,
     /// 统计信息
-    stats: Arc<RwLock<ResponseWriteBackStats>>,
+    stats: Arc<RwLock<InboundResponseStats>>,
 }
 
-/// 响应写回配置
+/// 入站响应配置
 #[derive(Debug, Clone)]
-pub struct ResponseWriteBackConfig {
+pub struct InboundResponseConfig {
     /// 是否启用响应写回
     pub enabled: bool,
     /// 写入缓冲区大小
@@ -44,9 +44,9 @@ pub struct ResponseWriteBackConfig {
     pub connection_timeout: std::time::Duration,
 }
 
-/// 响应写回统计信息
+/// 入站响应统计信息
 #[derive(Debug, Default, Clone)]
-pub struct ResponseWriteBackStats {
+pub struct InboundResponseStats {
     /// 总响应数
     total_responses: u64,
     /// HTTP/1.1响应数
@@ -67,20 +67,20 @@ pub struct ResponseWriteBackStats {
     keep_alive_connections: u64,
 }
 
-impl ResponseWriteBackMiddleware {
-    /// 创建新的响应写回中间件
+impl InboundResponseMiddleware {
+    /// 创建新的入站响应中间件
     pub fn new() -> Self {
         Self {
-            config: ResponseWriteBackConfig::default(),
-            stats: Arc::new(RwLock::new(ResponseWriteBackStats::default())),
+            config: InboundResponseConfig::default(),
+            stats: Arc::new(RwLock::new(InboundResponseStats::default())),
         }
     }
     
     /// 使用配置创建中间件
-    pub fn with_config(config: ResponseWriteBackConfig) -> Self {
+    pub fn with_config(config: InboundResponseConfig) -> Self {
         Self {
             config,
-            stats: Arc::new(RwLock::new(ResponseWriteBackStats::default())),
+            stats: Arc::new(RwLock::new(InboundResponseStats::default())),
         }
     }
     
@@ -379,7 +379,7 @@ impl ResponseWriteBackMiddleware {
     }
     
     /// 获取统计信息
-    pub async fn get_stats(&self) -> ResponseWriteBackStats {
+    pub async fn get_stats(&self) -> InboundResponseStats {
         self.stats.read().await.clone()
     }
 }
@@ -397,13 +397,13 @@ enum ConnectionType {
     Unknown,
 }
 
-impl Default for ResponseWriteBackMiddleware {
+impl Default for InboundResponseMiddleware {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Default for ResponseWriteBackConfig {
+impl Default for InboundResponseConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -418,9 +418,9 @@ impl Default for ResponseWriteBackConfig {
 }
 
 #[async_trait]
-impl Middleware for ResponseWriteBackMiddleware {
+impl Middleware for InboundResponseMiddleware {
     fn name(&self) -> &str {
-        "response_writeback"
+        "inbound_response"
     }
     
     #[instrument(skip(self, context, _core))]

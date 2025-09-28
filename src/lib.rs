@@ -49,7 +49,7 @@ pub use core::engine::*;
 pub use core::middleware::{
     TlsMiddleware, Http1StreamMiddleware, Http2StreamMiddleware,
     RuleMatchingMiddleware, HttpModificationMiddleware,
-    ForwardingMiddleware, ResponseMergeMiddleware, UserInterventionMiddleware
+    OutboundRequestMiddleware, ResponseMergeMiddleware, UserInterventionMiddleware
 };
 
 // 服务（使用具体导入避免ConnectionState冲突）

@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::any::{Any, TypeId};
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::{Duration, Instant};
 use futures::StreamExt;
@@ -44,6 +45,68 @@ pub use services::{StateManager, ReplayManager};
 use crate::error::TakeoverError;
 use crate::user_manager::UserManager;
 
+/// 类型安全的服务容器 - 基于 TypeId 的依赖注入
+/// 
+/// 提供类似 Tauri 风格的服务注册和查询功能：
+/// - 编译时类型安全
+/// - 运行时动态查询
+/// - 支持任何实现 Send + Sync 的类型
+#[derive(Debug, Clone)]
+pub struct ServiceContainer {
+    services: Arc<RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
+}
+
+impl ServiceContainer {
+    /// 创建新的服务容器
+    pub fn new() -> Self {
+        Self {
+            services: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+    
+    /// 注册服务到容器
+    /// 
+    /// # 示例
+    /// ```rust
+    /// let container = ServiceContainer::new();
+    /// container.register(MyService::new()).await;
+    /// ```
+    pub async fn register<T: Any + Send + Sync>(&self, service: T) {
+        let type_id = TypeId::of::<T>();
+        let mut services = self.services.write().await;
+        services.insert(type_id, Arc::new(service));
+        debug!("📦 Service registered: {:?}", std::any::type_name::<T>());
+    }
+    
+    /// 从容器中获取服务
+    /// 
+    /// # 示例
+    /// ```rust
+    /// if let Some(service) = container.get::<MyService>().await {
+    ///     // 使用服务
+    /// }
+    /// ```
+    pub async fn get<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        let type_id = TypeId::of::<T>();
+        let services = self.services.read().await;
+        services.get(&type_id)
+            .and_then(|service| service.clone().downcast::<T>().ok())
+    }
+    
+    /// 检查服务是否已注册
+    pub async fn contains<T: Any + Send + Sync>(&self) -> bool {
+        let type_id = TypeId::of::<T>();
+        let services = self.services.read().await;
+        services.contains_key(&type_id)
+    }
+    
+    /// 获取已注册服务的数量
+    pub async fn len(&self) -> usize {
+        let services = self.services.read().await;
+        services.len()
+    }
+}
+
 /// 应用核心 - 六边形架构的中心
 /// 
 /// AppCore是系统的"大脑"，负责：
@@ -70,6 +133,9 @@ pub struct AppCore {
     
     /// 用户管理器（防循环用户切换）
     user_manager: Arc<UserManager>,
+    
+    /// 服务容器 - TypeId 驱动的依赖注入
+    services: ServiceContainer,
     
     /// 连接管理
     active_connections: Arc<RwLock<HashMap<ConnectionId, ConnectionTracker>>>,
@@ -167,6 +233,9 @@ impl AppCore {
             Arc::new(UserManager::new())
         };
         
+        // 创建服务容器
+        let services = ServiceContainer::new();
+        
         Self {
             engine: Arc::new(engine),
             config,
@@ -179,6 +248,7 @@ impl AppCore {
             state_port: None,
             ui_port: None,
             user_manager,
+            services,
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(Semaphore::new(max_connections)),
             running: Arc::new(AtomicBool::new(false)),
@@ -217,6 +287,9 @@ impl AppCore {
             Arc::new(UserManager::new())
         };
         
+        // 创建服务容器
+        let services = ServiceContainer::new();
+        
         Self {
             engine: Arc::new(engine),
             config,
@@ -229,6 +302,7 @@ impl AppCore {
             state_port: None, // 可以在需要时添加
             ui_port: None,    // 可以在需要时添加
             user_manager,
+            services,
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             connection_semaphore: Arc::new(Semaphore::new(max_connections)),
             running: Arc::new(AtomicBool::new(false)),
@@ -293,6 +367,56 @@ impl AppCore {
     
     pub fn ui_port(&self) -> Option<&Arc<dyn UiPort>> {
         self.ui_port.as_ref()
+    }
+    
+    // ====================================
+    // 服务容器管理方法 (Tauri 风格 API)
+    // ====================================
+    
+    /// 注册服务到AppCore - Tauri风格的manage()方法
+    /// 
+    /// 这个方法提供了类型安全的依赖注入功能：
+    /// - 编译时类型检查
+    /// - 运行时动态查询
+    /// - 支持任何 Send + Sync 的类型
+    /// 
+    /// # 示例
+    /// ```rust
+    /// // 注册服务
+    /// app_core.manage(MyService::new()).await;
+    /// 
+    /// // 查询服务
+    /// if let Some(service) = app_core.state::<MyService>().await {
+    ///     service.do_something().await;
+    /// }
+    /// ```
+    pub async fn manage<T: Any + Send + Sync>(&self, service: T) {
+        self.services.register(service).await;
+    }
+    
+    /// 从AppCore获取服务 - Tauri风格的state()方法
+    /// 
+    /// 通过类型参数获取之前注册的服务实例。
+    /// 返回 Arc<T> 以支持多线程访问。
+    /// 
+    /// # 示例
+    /// ```rust
+    /// if let Some(rule_service) = app_core.state::<RuleService>().await {
+    ///     let rules = rule_service.get_active_rules().await;
+    /// }
+    /// ```
+    pub async fn state<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.services.get::<T>().await
+    }
+    
+    /// 检查服务是否已注册
+    pub async fn has_service<T: Any + Send + Sync>(&self) -> bool {
+        self.services.contains::<T>().await
+    }
+    
+    /// 获取已注册服务的数量
+    pub async fn service_count(&self) -> usize {
+        self.services.len().await
     }
     
     /// 获取处理引擎
@@ -750,6 +874,7 @@ impl Clone for AppCore {
             ui_port: self.ui_port.as_ref().map(Arc::clone),
             engine: Arc::clone(&self.engine),
             user_manager: Arc::clone(&self.user_manager),
+            services: self.services.clone(),
             active_connections: Arc::clone(&self.active_connections),
             connection_semaphore: Arc::clone(&self.connection_semaphore),
             running: Arc::clone(&self.running),

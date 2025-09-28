@@ -576,6 +576,8 @@ pub enum RuleAction {
     Block,
     Direct,
     Proxy(crate::config::ProxyConfig),
+    /// 使用代理名称标识的代理动作（推荐使用）
+    ProxyByName(String),
     ModifyRequest(RequestModifications),
     ModifyResponse(Vec<RequestModification>),
     InterceptForApproval,

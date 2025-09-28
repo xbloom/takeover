@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{info, warn, debug, instrument};
+use tracing::{ warn, debug, instrument};
 use async_trait::async_trait;
 use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
 use rustls::ClientConfig;

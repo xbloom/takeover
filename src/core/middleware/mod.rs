@@ -13,8 +13,8 @@ pub mod http_modification;
 pub mod script;
 pub mod user_intervention;
 pub mod response_merge;
-pub mod forwarding;    // 新的转发中间件
-pub mod response_writeback; // 响应写回中间件
+pub mod forwarding;    // 出站请求中间件
+pub mod response_writeback; // 入站响应中间件
 
 // 重新导出主要的中间件
 pub use protocol_detection::ProtocolDetectionMiddleware; // 协议检测中间件
@@ -28,5 +28,5 @@ pub use http_modification::HttpModificationMiddleware;
 pub use script::ScriptMiddleware;
 pub use user_intervention::UserInterventionMiddleware;
 pub use response_merge::ResponseMergeMiddleware;
-pub use forwarding::ForwardingMiddleware; // 新的转发中间件
-pub use response_writeback::ResponseWriteBackMiddleware; // 响应写回中间件
+pub use forwarding::OutboundRequestMiddleware; // 出站请求中间件
+pub use response_writeback::InboundResponseMiddleware; // 入站响应中间件

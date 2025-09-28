@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 use async_trait::async_trait;
-use tracing::{debug, error, instrument};
+use tracing::{debug, instrument};
 
 use super::model::*;
 
@@ -59,6 +59,49 @@ pub trait Middleware: Send + Sync {
     /// 是否启用
     fn enabled(&self) -> bool {
         true
+    }
+    
+    /// 🆕 注册服务到 AppCore (可选实现)
+    /// 
+    /// 中间件可以重写此方法来注册自己需要的服务。
+    /// 这个方法在中间件添加到管道时调用。
+    /// 
+    /// # 参数
+    /// - `app_core`: AppCore引用，用于注册服务
+    /// 
+    /// # 示例
+    /// ```rust
+    /// async fn register_services(&self, app_core: &AppCore) -> Result<(), AppError> {
+    ///     let my_service = MyService::new();
+    ///     app_core.manage(my_service).await;
+    ///     Ok(())
+    /// }
+    /// ```
+    async fn register_services(&self, _app_core: &crate::core::AppCore) -> Result<(), TakeoverError> {
+        // 默认实现：什么也不做
+        Ok(())
+    }
+    
+    /// 🆕 初始化中间件 (可选实现)
+    /// 
+    /// 中间件可以重写此方法来执行初始化逻辑。
+    /// 这个方法在服务注册完成后调用。
+    /// 
+    /// # 参数
+    /// - `app_core`: AppCore引用，可以访问已注册的服务
+    /// 
+    /// # 示例
+    /// ```rust
+    /// async fn initialize(&self, app_core: &AppCore) -> Result<(), AppError> {
+    ///     if let Some(service) = app_core.state::<MyService>().await {
+    ///         service.initialize().await?;
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    async fn initialize(&self, _app_core: &crate::core::AppCore) -> Result<(), TakeoverError> {
+        // 默认实现：什么也不做
+        Ok(())
     }
 }
 
@@ -323,11 +366,11 @@ impl ProcessingEngine {
             // ✏️ HTTP修改中间件 (优先级50) - 请求/响应修改
             Arc::new(middleware::http_modification::HttpModificationMiddleware::new()),
             
-            // 🔄 转发中间件 (优先级60) - 关键！负责实际的网络请求
-            Arc::new(middleware::forwarding::ForwardingMiddleware::new()),
+            // 🔄 出站请求中间件 (优先级60) - 关键！负责实际的网络请求
+            Arc::new(middleware::forwarding::OutboundRequestMiddleware::new()),
             
-            // 📤 响应写回中间件 (优先级75) - 统一HTTP/1.1响应输出
-            Arc::new(middleware::response_writeback::ResponseWriteBackMiddleware::new()),
+            // 📤 入站响应中间件 (优先级75) - 统一HTTP/1.1响应输出
+            Arc::new(middleware::response_writeback::InboundResponseMiddleware::new()),
         ]
         
         // 注意：以下中间件需要端口依赖，在new_with_all_ports中单独添加：

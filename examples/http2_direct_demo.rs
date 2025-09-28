@@ -22,8 +22,9 @@ use tokio::signal;
 use takeover::core::{AppCore, AppConfig, GeneralConfig, InboundConfig, OutboundConfig, ScriptConfig};
 
 // 导入适配器
-use takeover::adapters::{PfInboundAdapter, DirectOutboundAdapter};
-use takeover::core::ports::ControlPort;
+use takeover::adapters::{PfInboundAdapter, CompositeOutboundAdapter};
+use takeover::core::ports::{ControlPort, ProxyConfig};
+use takeover::core::model::{Rule, RulePattern, RuleAction};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -185,7 +186,7 @@ async fn build_demo_app(config: AppConfig) -> Result<AppCore> {
     let event_port = Arc::new(SimpleEventPort::new());
     
     // 3. 组装应用核心
-    let app_core = AppCore::new(
+    let mut app_core = AppCore::new(
         (*config).clone(),
         inbound_adapter,
         outbound_adapter,
@@ -193,8 +194,58 @@ async fn build_demo_app(config: AppConfig) -> Result<AppCore> {
         event_port,
     );
     
+    // 4. 配置分流规则
+    configure_routing_rules(&mut app_core).await?;
+    
     info!("✅ Demo应用程序构建完成");
     Ok(app_core)
+}
+
+/// 配置路由分流规则
+async fn configure_routing_rules(app_core: &mut AppCore) -> Result<()> {
+    info!("🎯 配置路由分流规则");
+    
+    let rules = vec![
+        // Rule 1: Google域名走SOCKS5代理
+        Rule::new(
+            "google_proxy",
+            "Google域名代理规则",
+            RulePattern::HostMatches("*.google.com".to_string()),
+            RuleAction::ProxyByName("default".to_string()), // 使用代理名称标识
+            10, // 高优先级
+        ),
+        
+        // Rule 2: curl程序走SOCKS5代理
+        Rule::new(
+            "curl_proxy",
+            "curl程序代理规则", 
+            RulePattern::ProcessMatches("*curl*".to_string()),
+            RuleAction::ProxyByName("default".to_string()), // 使用代理名称标识
+            20, // 中优先级
+        ),
+        
+        // Rule 3: 其他所有流量直连
+        Rule::new(
+            "default_direct",
+            "默认直连规则",
+            RulePattern::HostMatches("*".to_string()),
+            RuleAction::Direct,
+            100, // 低优先级（兜底规则）
+        ),
+    ];
+    
+    // 通过ControlPort应用规则
+    app_core.control_port().apply_rules(rules).await
+        .map_err(|e| anyhow::anyhow!("Failed to apply rules: {}", e))?;
+    
+    info!("✅ 规则配置完成:");
+    info!("   1. Google域名 → SOCKS5代理 (代理名称: default)");
+    info!("   2. curl程序 → SOCKS5代理 (代理名称: default)");
+    info!("   3. 其他流量 → 直连");
+    info!("   - 使用代理名称标识设计，规则中只存储代理名称");
+    info!("   - CompositeOutboundAdapter根据代理名称查找具体配置");
+    
+    Ok(())
 }
 
 /// 创建入站适配器 (pfctl)
@@ -209,15 +260,25 @@ async fn create_inbound_adapter(
     Ok(Arc::new(adapter))
 }
 
-/// 创建出站适配器 (Direct)
+/// 创建出站适配器 (Composite - Direct + SOCKS5)
 async fn create_outbound_adapter(
     _config: &AppConfig
 ) -> Result<Arc<dyn takeover::core::ports::OutboundPort>> {
-    info!("📤 创建Direct出站适配器");
+    info!("📤 创建复合出站适配器 (Direct + SOCKS5)");
     
-    let adapter = DirectOutboundAdapter::new();
+    // 配置SOCKS5代理
+    let socks5_config = ProxyConfig {
+        url: "socks5://127.0.0.1:7897".to_string(),
+        proxy_type: takeover::config::ProxyType::Socks5,
+        auth: None,
+    };
     
-    info!("✅ Direct出站适配器创建完成");
+    let adapter = CompositeOutboundAdapter::with_socks5_config(socks5_config);
+    
+    info!("✅ 复合出站适配器创建完成");
+    info!("   - Direct适配器：直连目标服务器");  
+    info!("   - SOCKS5适配器：127.0.0.1:7897");
+    info!("   - 路由规则：根据RuleMatchingMiddleware决策选择");
     Ok(Arc::new(adapter))
 }
 

@@ -112,6 +112,8 @@ pub struct RoutingResult {
 pub enum RoutingDecisionType {
     /// 通过代理
     Proxy { proxy_config: Option<crate::config::ProxyConfig> },
+    /// 通过代理名称标识的代理（推荐使用）
+    ProxyByName { proxy_name: String },
     /// 直接连接
     Direct,
     /// 拒绝连接
@@ -427,6 +429,18 @@ impl RuleMatchingMiddleware {
                     tls_interception_mode: TlsInterceptionMode::Selective,
                 })
             }
+            RuleAction::ProxyByName(proxy_name) => {
+                self.update_proxy_decision_stats().await;
+                Ok(RoutingResult {
+                    decision: RoutingDecisionType::ProxyByName {
+                        proxy_name: proxy_name.clone()
+                    },
+                    matched_rule_id: rule_id,
+                    rewritten_url: None,
+                    applied_modifications: None,
+                    tls_interception_mode: TlsInterceptionMode::Selective,
+                })
+            }
             RuleAction::Direct => {
                 self.update_direct_decision_stats().await;
                 Ok(RoutingResult {
@@ -655,11 +669,16 @@ impl Middleware for RuleMatchingMiddleware {
                 context.custom_data.insert(
                     "routing_decision".to_string(),
                     serde_json::json!({
-                        "decision": match routing_result.decision {
+                        "decision": match &routing_result.decision {
                             RoutingDecisionType::Proxy { .. } => "proxy",
+                            RoutingDecisionType::ProxyByName { .. } => "proxy_by_name",
                             RoutingDecisionType::Direct => "direct",
                             RoutingDecisionType::Deny { .. } => "deny",
                             RoutingDecisionType::Pause { .. } => "pause"
+                        },
+                        "proxy_name": match &routing_result.decision {
+                            RoutingDecisionType::ProxyByName { proxy_name } => Some(proxy_name.clone()),
+                            _ => None
                         },
                         "matched_rule_id": routing_result.matched_rule_id,
                         "rewritten_url": routing_result.rewritten_url,
@@ -671,6 +690,10 @@ impl Middleware for RuleMatchingMiddleware {
                 match routing_result.decision {
                     RoutingDecisionType::Proxy { .. } => {
                         debug!("Connection {} routed via proxy", context.id);
+                        Ok(MiddlewareResult::Continue)
+                    }
+                    RoutingDecisionType::ProxyByName { ref proxy_name } => {
+                        debug!("Connection {} routed via proxy: {}", context.id, proxy_name);
                         Ok(MiddlewareResult::Continue)
                     }
                     RoutingDecisionType::Direct => {

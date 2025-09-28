@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{warn, error, debug, instrument};
 use async_trait::async_trait;
 
 use crate::core::engine::{Middleware, MiddlewareResult};

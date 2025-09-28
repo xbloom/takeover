@@ -2,11 +2,11 @@
 //! 
 //! 提供HTTP REST API接口用于管理和控制代理系统
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::sync::RwLock;
-use tracing::{info, warn, error, debug, instrument};
+use tracing::{info, error, debug, instrument};
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
 
@@ -35,6 +35,7 @@ pub struct RestControlAdapter {
 }
 
 /// 被拦截的连接信息
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct InterceptedConnection {
     connection_id: ConnectionId,
@@ -45,6 +46,7 @@ struct InterceptedConnection {
 }
 
 /// 拦截状态
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum InterceptionStatus {
     Pending,
@@ -217,7 +219,7 @@ impl RestControlAdapter {
         
         let mut intercepted = self.intercepted_connections.write().await;
         
-        if let Some(mut connection) = intercepted.values_mut()
+        if let Some(connection) = intercepted.values_mut()
             .find(|c| c.request_id == request_id) {
             
             connection.status = match decision.decision.as_str() {
@@ -338,10 +340,10 @@ impl ControlPort for RestControlAdapter {
     }
     
     async fn intercept_connection(&self, conn_id: ConnectionId) -> Result<(), AppError> {
-        debug!("Intercepting connection {} via REST adapter", conn_id);
+        debug!("Intercepting connection {} via REST adapter", &conn_id);
         
         let intercepted_connection = InterceptedConnection {
-            connection_id: conn_id,
+            connection_id: conn_id.clone(),
             request_id: uuid::Uuid::new_v4(),
             intercepted_at: std::time::SystemTime::now(),
             status: InterceptionStatus::Pending,
@@ -350,7 +352,7 @@ impl ControlPort for RestControlAdapter {
         
         {
             let mut intercepted = self.intercepted_connections.write().await;
-            intercepted.insert(conn_id, intercepted_connection);
+            intercepted.insert(conn_id.clone(), intercepted_connection);
         }
         
         {
@@ -358,7 +360,6 @@ impl ControlPort for RestControlAdapter {
             stats.connections_intercepted += 1;
         }
         
-        info!("✅ Connection {} intercepted", conn_id);
         Ok(())
     }
     
@@ -496,7 +497,7 @@ mod tests {
         let adapter = RestControlAdapter::default();
         let conn_id = uuid::Uuid::new_v4();
         
-        let result = adapter.intercept_connection(conn_id).await;
+        let result = adapter.intercept_connection(conn_id.to_string()).await;
         assert!(result.is_ok());
         
         let intercepted = adapter.intercepted_connections.read().await;

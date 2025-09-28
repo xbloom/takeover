@@ -2,6 +2,6 @@
 //! 
 //! 负责提供管理和控制接口
 
-// pub mod api;
+pub mod api;
 
-// pub use api::RestControlAdapter;
+pub use api::RestControlAdapter;
