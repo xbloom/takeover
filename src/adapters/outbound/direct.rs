@@ -1,19 +1,19 @@
 //! 直连出站适配器
 //! 
 //! 提供直接连接到目标服务器的功能，不经过任何代理
+//! 使用统一的TLS Service处理TLS连接
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{ warn, debug, instrument};
+use tracing::{warn, debug};
 use async_trait::async_trait;
-use tokio_rustls::{TlsConnector, client::TlsStream as ClientTlsStream};
-use rustls::ClientConfig;
-use std::sync::Arc as StdArc;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
 
 use crate::core::ports::{OutboundPort, NetworkStream, AppError};
 use crate::core::model::ConnectionContext;
+use crate::core::services::TlsService;
 
 /// 直连出站适配器
 /// 
@@ -22,6 +22,7 @@ use crate::core::model::ConnectionContext;
 /// 2. 管理连接超时
 /// 3. 提供连接统计
 /// 4. 支持连接重试机制
+/// 5. 使用TLS Service处理TLS连接
 pub struct DirectOutboundAdapter {
     /// 连接超时
     connect_timeout: Duration,
@@ -50,9 +51,13 @@ pub struct DirectStats {
     pub total_retries: u64,
     /// 平均连接时间
     pub avg_connect_time: Option<Duration>,
+    /// TLS连接数
+    pub tls_connections: u64,
+    /// TCP连接数
+    pub tcp_connections: u64,
 }
 
-/// 直连网络流实现
+/// 直连网络流实现（TCP）
 struct DirectNetworkStream {
     /// 底层TCP流
     stream: TcpStream,
@@ -69,7 +74,7 @@ struct DirectNetworkStream {
     remote_addr: std::net::SocketAddr,
 }
 
-/// 直连TLS网络流实现
+/// 直连TLS网络流实现（TLS）
 struct DirectTlsNetworkStream {
     /// 底层TLS流
     stream: ClientTlsStream<TcpStream>,
@@ -87,70 +92,6 @@ impl DirectTlsNetworkStream {
             target_host,
             target_port,
         }
-    }
-}
-
-/// 跳过TLS服务器证书验证（仅用于开发测试）
-/// 
-/// ⚠️ **警告**: 这会跳过所有TLS安全检查，仅用于开发环境！
-#[derive(Debug)]
-struct SkipServerVerification;
-
-impl SkipServerVerification {
-    fn new() -> Self {
-        Self
-    }
-}
-
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // ⚠️ 跳过所有验证，接受任何证书
-        debug!("⚠️  Skipping TLS certificate verification (development mode)");
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        // 支持所有签名方案
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA1,
-            rustls::SignatureScheme::ECDSA_SHA1_Legacy,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
     }
 }
 
@@ -178,32 +119,43 @@ impl DirectOutboundAdapter {
         self
     }
     
-    /// 设置重试配置
+    /// 设置最大重试次数
+    pub fn with_max_retries(mut self, retries: usize) -> Self {
+        self.max_retries = retries;
+        self
+    }
+    
+    /// 设置重试延迟
+    pub fn with_retry_delay(mut self, delay: Duration) -> Self {
+        self.retry_delay = delay;
+        self
+    }
+    
+    /// 设置重试配置（最大重试次数和重试延迟）
     pub fn with_retry_config(mut self, max_retries: usize, retry_delay: Duration) -> Self {
         self.max_retries = max_retries;
         self.retry_delay = retry_delay;
         self
     }
     
-    /// 直接连接到目标地址
-    #[instrument(skip(self))]
-    async fn connect_direct(
-        &self,
-        target_host: &str,
-        target_port: u16,
-    ) -> Result<TcpStream, AppError> {
+    /// 建立TCP连接到目标服务器
+    async fn connect_tcp(&self, target_host: &str, target_port: u16) -> Result<TcpStream, AppError> {
         let target_addr = format!("{}:{}", target_host, target_port);
         let start_time = std::time::Instant::now();
         
-        debug!("Attempting direct connection to {}", target_addr);
+        let mut last_error = None;
         
-        let mut retry_count = 0;
-        #[allow(unused_assignments)]
-        let mut final_error = AppError::Config(format!("Failed to connect to {} after {} retries", target_addr, self.max_retries));
-        
-        loop {
-            // 更新统计
-            self.update_attempt_stats().await;
+        for attempt in 0..=self.max_retries {
+            if attempt > 0 {
+                debug!("Retry attempt {} for {}", attempt, target_addr);
+                tokio::time::sleep(self.retry_delay * attempt as u32).await;
+                
+                // 更新重试统计
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.total_retries += 1;
+                }
+            }
             
             match timeout(
                 self.connect_timeout,
@@ -211,67 +163,56 @@ impl DirectOutboundAdapter {
             ).await {
                 Ok(Ok(stream)) => {
                     let connect_time = start_time.elapsed();
-                    debug!("Direct connection to {} established in {:?}", target_addr, connect_time);
+                    debug!("✅ TCP connection established to {} in {:?}", target_addr, connect_time);
                     
-                    // 更新成功统计
+                    // 更新统计
                     self.update_success_stats(connect_time).await;
                     
                     return Ok(stream);
                 }
                 Ok(Err(e)) => {
-                    final_error = AppError::Config(format!("Connection failed: {}", e));
+                    last_error = Some(AppError::Config(format!("Connection failed: {}", e)));
+                    warn!("❌ TCP connection attempt {} failed to {}: {}", attempt + 1, target_addr, e);
                 }
                 Err(_) => {
-                    // 超时
-                    final_error = AppError::Config(format!("Connection to {} timed out", target_addr));
-                    self.update_timeout_stats().await;
+                    last_error = Some(AppError::Config(format!("Connection timeout to {}", target_addr)));
+                    warn!("❌ TCP connection attempt {} timed out to {}", attempt + 1, target_addr);
+                    
+                    // 更新超时统计
+                    {
+                        let mut stats = self.stats.write().await;
+                        stats.timeout_connections += 1;
+                    }
                 }
             }
-            
-            retry_count += 1;
-            if retry_count > self.max_retries {
-                break;
-            }
-            
-            debug!("Connection attempt {} failed, retrying in {:?}", retry_count, self.retry_delay);
-            self.update_retry_stats().await;
-            tokio::time::sleep(self.retry_delay).await;
         }
         
         // 所有重试都失败了
         self.update_failure_stats().await;
-        debug!("Failed to connect to {} after {} attempts", target_addr, retry_count);
-        
-        Err(final_error)
+        Err(last_error.unwrap_or_else(|| AppError::Config(format!("Failed to connect to {}", target_addr))))
     }
     
-    /// 检查目标是否可达
-    #[allow(dead_code)]
-    async fn is_target_reachable(&self, target_host: &str, target_port: u16) -> bool {
-        // 简单的连通性检查
-        let target_addr = format!("{}:{}", target_host, target_port);
+    /// 使用TLS Service建立TLS连接
+    async fn connect_tls_with_service(
+        &self,
+        tcp_stream: TcpStream,
+        target_host: &str,
+        tls_service: &TlsService,
+    ) -> Result<ClientTlsStream<TcpStream>, AppError> {
+        debug!("🔐 使用TLS Service建立服务器TLS连接: {}", target_host);
         
-        match timeout(
-            Duration::from_secs(5), // 快速检查，使用较短的超时
-            TcpStream::connect(&target_addr)
-        ).await {
-            Ok(Ok(stream)) => {
-                drop(stream);
-                true
-            }
-            _ => false
-        }
-    }
-    
-    /// 更新尝试统计
-    async fn update_attempt_stats(&self) {
-        let mut stats = self.stats.write().await;
-        stats.total_attempts += 1;
+        let tls_stream = tls_service
+            .connect_server_tls(tcp_stream, target_host)
+            .await?;
+        
+        debug!("✅ TLS连接建立成功: {}", target_host);
+        Ok(tls_stream)
     }
     
     /// 更新成功统计
     async fn update_success_stats(&self, connect_time: Duration) {
         let mut stats = self.stats.write().await;
+        stats.total_attempts += 1;
         stats.successful_connections += 1;
         
         // 更新平均连接时间
@@ -284,19 +225,20 @@ impl DirectOutboundAdapter {
     /// 更新失败统计
     async fn update_failure_stats(&self) {
         let mut stats = self.stats.write().await;
+        stats.total_attempts += 1;
         stats.failed_connections += 1;
     }
     
-    /// 更新超时统计
-    async fn update_timeout_stats(&self) {
+    /// 更新TLS连接统计
+    async fn update_tls_stats(&self) {
         let mut stats = self.stats.write().await;
-        stats.timeout_connections += 1;
+        stats.tls_connections += 1;
     }
     
-    /// 更新重试统计
-    async fn update_retry_stats(&self) {
+    /// 更新TCP连接统计
+    async fn update_tcp_stats(&self) {
         let mut stats = self.stats.write().await;
-        stats.total_retries += 1;
+        stats.tcp_connections += 1;
     }
     
     /// 获取统计信息
@@ -304,164 +246,89 @@ impl DirectOutboundAdapter {
         self.stats.read().await.clone()
     }
     
-    /// 获取成功率
-    pub async fn get_success_rate(&self) -> f64 {
-        let stats = self.stats.read().await;
-        if stats.total_attempts == 0 {
-            0.0
-        } else {
-            stats.successful_connections as f64 / stats.total_attempts as f64
-        }
-    }
-    
-    /// 判断是否应该使用TLS连接
-    /// 
-    /// 根据转发中间件设置的协议信息决定
-    fn should_use_tls(&self, context: &ConnectionContext) -> bool {
-        // 🔒 Copy Pipe模式：强制使用TCP连接，让客户端直接与服务器进行TLS握手
-        if context.custom_data.get("copy_pipe_mode").and_then(|v| v.as_bool()).unwrap_or(false) {
-            debug!("Copy Pipe模式：强制使用TCP连接 (目标: {}:{})", context.target_host, context.target_port);
-            return false;
-        }
-        
-        // 🔍 检查转发中间件设置的原始目标协议
+    /// 检查是否需要TLS连接
+    fn needs_tls_connection(&self, context: &ConnectionContext) -> bool {
+        // 检查自定义数据中的协议信息
         if let Some(protocol) = context.custom_data.get("original_target_protocol") {
             if let Some(protocol_str) = protocol.as_str() {
                 return protocol_str == "https";
             }
         }
         
-        // 🔍 回退到端口检测
+        // 根据端口判断
         matches!(context.target_port, 443 | 8443 | 9443)
     }
     
-    /// 建立TLS连接到目标服务器
-    #[instrument(skip(self))]
-    async fn connect_tls(
-        &self,
-        target_host: &str,
-        target_port: u16,
-    ) -> Result<ClientTlsStream<TcpStream>, AppError> {
-        debug!("🔐 建立TLS连接到: {}:{}", target_host, target_port);
-        
-        // 1️⃣ 先建立TCP连接
-        let tcp_stream = self.connect_direct(target_host, target_port).await?;
-        
-        // 2️⃣ 创建TLS客户端配置 - 暂时使用危险模式解决版本冲突
-        // TODO: 生产环境必须启用正确的证书验证
-        let config = ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(StdArc::new(SkipServerVerification::new()))
-            .with_no_client_auth();
-        
-        debug!("⚠️  Using TLS client config without certificate verification (development only)");
-        
-        let connector = TlsConnector::from(StdArc::new(config));
-        
-        // 3️⃣ 进行TLS握手 
-        let domain = target_host.to_string().try_into()
-            .map_err(|e| AppError::Handshake(format!("Invalid domain name: {}", e)))?;
-        
-        debug!("🤝 开始TLS握手: {}", target_host);
-        let tls_stream = connector.connect(domain, tcp_stream).await
-            .map_err(|e| AppError::Handshake(format!("TLS handshake failed: {}", e)))?;
-        
-        debug!("✅ TLS连接已建立: {}:{}", target_host, target_port);
-        Ok(tls_stream)
+    /// 从全局AppCore获取TLS Service (类似Tauri的全局状态访问)
+    async fn get_tls_service() -> Option<Arc<TlsService>> {
+        // 通过全局单例访问AppCore，无需传递引用
+        let app_core = crate::core::AppCore::global();
+        app_core.state::<TlsService>().await
     }
 }
 
 #[async_trait]
 impl OutboundPort for DirectOutboundAdapter {
-    #[instrument(skip(self, context))]
+    // #[instrument(skip(self, context))]
     async fn connect(&self, context: &ConnectionContext) -> Result<Box<dyn NetworkStream>, AppError> {
-        // 🔍 检查原始目标协议
-        let is_https = self.should_use_tls(context);
+        debug!("DirectOutboundAdapter connecting to {}:{}", context.target_host, context.target_port);
         
-        debug!("Establishing direct connection to {}:{} (TLS: {})", 
-               context.target_host, context.target_port, is_https);
+        // 建立TCP连接
+        let tcp_stream = self.connect_tcp(&context.target_host, context.target_port).await?;
         
-        // 更新尝试统计
-        self.update_attempt_stats().await;
-        
-        let start_time = tokio::time::Instant::now();
-        
-        if is_https {
-            // 🔐 建立TLS连接到服务器
-            match self.connect_tls(&context.target_host, context.target_port).await {
-                Ok(tls_stream) => {
-                    let connect_time = start_time.elapsed();
-                    self.update_success_stats(connect_time).await;
-                    
-                    debug!("✅ Direct TLS connection established to {}:{}", context.target_host, context.target_port);
-                    Ok(Box::new(DirectTlsNetworkStream::new(tls_stream, context.target_host.clone(), context.target_port)))
-                }
-                Err(e) => {
-                    self.update_failure_stats().await;
-                    debug!("❌ Failed to establish TLS connection: {}", e);
-                    Err(e)
-                }
+        // 检查是否需要TLS
+        if self.needs_tls_connection(context) {
+            debug!("🔐 需要建立TLS连接到: {}", context.target_host);
+            
+            // 通过全局AppCore获取TLS Service (类似Tauri全局状态访问)
+            if let Some(tls_service) = Self::get_tls_service().await {
+                let tls_stream = self.connect_tls_with_service(tcp_stream, &context.target_host, &tls_service).await?;
+                self.update_tls_stats().await;
+                
+                Ok(Box::new(DirectTlsNetworkStream::new(
+                    tls_stream,
+                    context.target_host.clone(),
+                    context.target_port,
+                )))
+            } else {
+                warn!("❌ TLS Service未注册到AppCore，请确保中间件服务已初始化");
+                Err(AppError::Config(
+                    "TLS Service not available. Please ensure middleware services are registered.".to_string()
+                ))
             }
         } else {
-            // 🌐 建立普通TCP连接  
-            match self.connect_direct(&context.target_host, context.target_port).await {
-                Ok(stream) => {
-                    let connect_time = start_time.elapsed();
-                    self.update_success_stats(connect_time).await;
-                    
-                    let local_addr = stream.local_addr()
-                        .map_err(|e| AppError::Config(format!("Failed to get local address: {}", e)))?;
-                    let remote_addr = stream.peer_addr()
-                        .map_err(|e| AppError::Config(format!("Failed to get remote address: {}", e)))?;
-                    
-                    let network_stream = DirectNetworkStream {
-                        stream,
-                        target_host: context.target_host.clone(),
-                        target_port: context.target_port,
-                        local_addr,
-                        remote_addr,
-                    };
-                    
-                    debug!("✅ Direct connection established: {} -> {}", local_addr, remote_addr);
-                    Ok(Box::new(network_stream))
-                }
-                Err(e) => {
-                    self.update_failure_stats().await;
-                    warn!("⚠️ 🔌 无法连接服务器: {}", e);
-                    Err(e)
-                }
-            }
+            // 返回TCP连接
+            debug!("✅ 使用TCP连接到: {}", context.target_host);
+            self.update_tcp_stats().await;
+            
+            let local_addr = tcp_stream.local_addr()
+                .map_err(|e| AppError::Config(format!("Failed to get local address: {}", e)))?;
+            let remote_addr = tcp_stream.peer_addr()
+                .map_err(|e| AppError::Config(format!("Failed to get remote address: {}", e)))?;
+            
+            Ok(Box::new(DirectNetworkStream {
+                stream: tcp_stream,
+                target_host: context.target_host.clone(),
+                target_port: context.target_port,
+                local_addr,
+                remote_addr,
+            }))
         }
     }
     
     async fn supports_target(&self, context: &ConnectionContext) -> bool {
-        // 直连适配器可以尝试连接任何目标，但有一些基本的检查
-        
-        // 检查是否是有效的主机名或IP地址
-        if context.target_host.is_empty() {
+        // 直连适配器理论上可以连接到任何可达的目标
+        if context.target_host.is_empty() || context.target_port == 0 {
             return false;
         }
         
-        // 检查端口范围
-        if context.target_port == 0 {
-            return false;
-        }
-        
-        #[cfg(debug_assertions)]
-        {
-            // 开发/测试环境：跳过网络可达性检查，只做基本验证
-            // 但排除明显不可达的测试地址
-            if context.target_host == "0.0.0.0" || (context.target_host == "127.0.0.1" && context.target_port == 9999) {
-                return false;
-            }
+        // 检查是否是本地地址或保留地址
+        if context.target_host == "127.0.0.1" || context.target_host == "localhost" {
             return true;
         }
         
-        #[cfg(not(debug_assertions))]
-        {
-            // 生产环境：进行真实的可达性检查
-            self.is_target_reachable(&context.target_host, context.target_port).await
-        }
+        // 其他情况都支持
+        true
     }
     
     fn name(&self) -> &str {
@@ -469,9 +336,12 @@ impl OutboundPort for DirectOutboundAdapter {
     }
 }
 
-// 实现NetworkStream trait for DirectNetworkStream
+// NetworkStream trait implementations
 impl NetworkStream for DirectNetworkStream {}
+impl NetworkStream for DirectTlsNetworkStream {}
 
+// AsyncRead/AsyncWrite implementations for DirectNetworkStream (TCP)
+#[async_trait]
 impl tokio::io::AsyncRead for DirectNetworkStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -482,6 +352,7 @@ impl tokio::io::AsyncRead for DirectNetworkStream {
     }
 }
 
+#[async_trait]
 impl tokio::io::AsyncWrite for DirectNetworkStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -506,23 +377,8 @@ impl tokio::io::AsyncWrite for DirectNetworkStream {
     }
 }
 
-impl DirectNetworkStream {
-    /// 获取连接信息
-    #[allow(dead_code)]
-    pub fn connection_info(&self) -> ConnectionInfo {
-        ConnectionInfo {
-            target_host: self.target_host.clone(),
-            target_port: self.target_port,
-            local_addr: self.local_addr,
-            remote_addr: self.remote_addr,
-            connection_type: "direct".to_string(),
-        }
-    }
-}
-
-// 实现NetworkStream trait for DirectTlsNetworkStream
-impl NetworkStream for DirectTlsNetworkStream {}
-
+// AsyncRead/AsyncWrite implementations for DirectTlsNetworkStream (TLS)
+#[async_trait]
 impl tokio::io::AsyncRead for DirectTlsNetworkStream {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
@@ -533,6 +389,7 @@ impl tokio::io::AsyncRead for DirectTlsNetworkStream {
     }
 }
 
+#[async_trait]
 impl tokio::io::AsyncWrite for DirectTlsNetworkStream {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
@@ -557,16 +414,6 @@ impl tokio::io::AsyncWrite for DirectTlsNetworkStream {
     }
 }
 
-/// 连接信息
-#[derive(Debug, Clone)]
-pub struct ConnectionInfo {
-    pub target_host: String,
-    pub target_port: u16,
-    pub local_addr: std::net::SocketAddr,
-    pub remote_addr: std::net::SocketAddr,
-    pub connection_type: String,
-}
-
 impl Default for DirectOutboundAdapter {
     fn default() -> Self {
         Self::new()
@@ -576,6 +423,7 @@ impl Default for DirectOutboundAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::model::Connection;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     
     #[tokio::test]
@@ -583,76 +431,54 @@ mod tests {
         let adapter = DirectOutboundAdapter::new();
         assert_eq!(adapter.name(), "direct");
         assert_eq!(adapter.connect_timeout, Duration::from_secs(30));
-        assert_eq!(adapter.read_timeout, Duration::from_secs(60));
         assert_eq!(adapter.max_retries, 3);
     }
     
     #[tokio::test]
-    async fn test_timeout_configuration() {
+    async fn test_configuration() {
         let adapter = DirectOutboundAdapter::new()
             .with_connect_timeout(Duration::from_secs(10))
-            .with_read_timeout(Duration::from_secs(30));
+            .with_max_retries(5)
+            .with_retry_delay(Duration::from_millis(200));
         
         assert_eq!(adapter.connect_timeout, Duration::from_secs(10));
-        assert_eq!(adapter.read_timeout, Duration::from_secs(30));
-    }
-    
-    #[tokio::test]
-    async fn test_retry_configuration() {
-        let adapter = DirectOutboundAdapter::new()
-            .with_retry_config(5, Duration::from_millis(1000));
-        
         assert_eq!(adapter.max_retries, 5);
-        assert_eq!(adapter.retry_delay, Duration::from_millis(1000));
+        assert_eq!(adapter.retry_delay, Duration::from_millis(200));
     }
     
     #[tokio::test]
-    async fn test_stats_initialization() {
+    async fn test_supports_target() {
         let adapter = DirectOutboundAdapter::new();
-        let stats = adapter.get_stats().await;
         
-        assert_eq!(stats.total_attempts, 0);
-        assert_eq!(stats.successful_connections, 0);
-        assert_eq!(stats.failed_connections, 0);
-        assert_eq!(stats.timeout_connections, 0);
-        assert_eq!(stats.total_retries, 0);
-        assert!(stats.avg_connect_time.is_none());
+        let connection = Connection::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80)
+        );
+        let context = ConnectionContext::new(connection, "google.com".to_string(), 80);
+        
+        assert!(adapter.supports_target(&context).await);
     }
     
     #[tokio::test]
-    async fn test_success_rate_calculation() {
+    async fn test_tls_detection() {
         let adapter = DirectOutboundAdapter::new();
         
-        // 初始状态成功率应该是0
-        assert_eq!(adapter.get_success_rate().await, 0.0);
+        // HTTPS端口
+        let connection = Connection::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 443)
+        );
+        let context = ConnectionContext::new(connection, "google.com".to_string(), 443);
         
-        // 模拟一些统计更新
-        adapter.update_attempt_stats().await;
-        adapter.update_success_stats(Duration::from_millis(100)).await;
+        assert!(adapter.needs_tls_connection(&context));
         
-        assert_eq!(adapter.get_success_rate().await, 1.0);
+        // HTTP端口
+        let connection = Connection::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80)
+        );
+        let context = ConnectionContext::new(connection, "google.com".to_string(), 80);
         
-        adapter.update_attempt_stats().await;
-        adapter.update_failure_stats().await;
-        
-        assert_eq!(adapter.get_success_rate().await, 0.5);
-    }
-    
-    #[test]
-    fn test_connection_info() {
-        let local_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345);
-        let remote_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80);
-        
-        let info = ConnectionInfo {
-            target_host: "example.com".to_string(),
-            target_port: 80,
-            local_addr,
-            remote_addr,
-            connection_type: "direct".to_string(),
-        };
-        
-        assert_eq!(info.target_host, "example.com");
-        assert_eq!(info.target_port, 80);
-        assert_eq!(info.connection_type, "direct");
+        assert!(!adapter.needs_tls_connection(&context));
     }
 }

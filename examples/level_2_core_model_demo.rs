@@ -3,9 +3,9 @@
 //! 展示重构后的六边形架构核心业务模型功能
 //! 独立运行，不依赖有编译错误的适配器模块
 
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::SystemTime;
+use hyper::HeaderMap;
 use uuid::Uuid;
 
 // 直接从src/core/model.rs导入核心模型
@@ -89,13 +89,13 @@ async fn demo_http_models() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🧪 3. HTTP模型演示");
     
     // HTTP请求
-    let mut headers = HashMap::new();
-    headers.insert("Host".to_string(), "api.example.com".to_string());
-    headers.insert("User-Agent".to_string(), "Takeover/1.0".to_string());
-    headers.insert("Accept".to_string(), "application/json".to_string());
-    
+    let mut headers = HeaderMap::new();
+    headers.insert("Host".parse::<hyper::header::HeaderName>().unwrap(), "api.example.com".parse::<hyper::header::HeaderValue>().unwrap());
+    headers.insert("User-Agent".parse::<hyper::header::HeaderName>().unwrap(), "Takeover/1.0".parse::<hyper::header::HeaderValue>().unwrap());
+    headers.insert("Accept".parse::<hyper::header::HeaderName>().unwrap(), "application/json".parse::<hyper::header::HeaderValue>().unwrap());
+
     let request = HttpRequest {
-        id: Some(Uuid::new_v4()),
+        id: Some(Uuid::new_v4().to_string()),
         method: "GET".to_string(),
         url: "https://api.example.com/v1/data".to_string(),
         version: "HTTP/1.1".to_string(),
@@ -111,10 +111,10 @@ async fn demo_http_models() -> Result<(), Box<dyn std::error::Error>> {
     println!("      Content-Length: {}", request.body.len());
     
     // HTTP响应
-    let mut response_headers = HashMap::new();
-    response_headers.insert("Content-Type".to_string(), "application/json".to_string());
-    response_headers.insert("Cache-Control".to_string(), "no-cache".to_string());
-    
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert("Content-Type".parse::<hyper::header::HeaderName>().unwrap(), "application/json".parse::<hyper::header::HeaderValue>().unwrap());
+    response_headers.insert("Cache-Control".parse::<hyper::header::HeaderName>().unwrap(), "no-cache".parse::<hyper::header::HeaderValue>().unwrap());
+
     let response_body = r#"{"message": "success", "data": {"users": 42}}"#;
     let response = HttpResponse {
         id: Some(Uuid::new_v4()),
@@ -144,8 +144,8 @@ async fn demo_rule_creation() -> Result<(), Box<dyn std::error::Error>> {
     
     // 创建允许规则
     let allow_rule = Rule::new(
-        "allow_api".to_string(),
-        "允许API访问".to_string(),
+        "allow_api",
+        "允许API访问",
         RulePattern::HostMatches("api.*.com".to_string()),
         RuleAction::Allow,
         100,
@@ -160,8 +160,8 @@ async fn demo_rule_creation() -> Result<(), Box<dyn std::error::Error>> {
     
     // 创建阻止规则
     let block_rule = Rule::new(
-        "block_ads".to_string(),
-        "阻止广告域名".to_string(),
+        "block_ads",
+        "阻止广告域名",
         RulePattern::HostMatches("*.ads.com".to_string()),
         RuleAction::Block,
         200,

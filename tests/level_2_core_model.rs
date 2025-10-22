@@ -25,8 +25,8 @@ fn create_test_connection() -> Connection {
 /// 创建测试用的HTTP请求
 fn create_test_http_request() -> HttpRequest {
     let mut request = HttpRequest::new("GET", "http://example.com/test");
-    request.headers.insert("Host".to_string(), "example.com".to_string());
-    request.headers.insert("User-Agent".to_string(), "takeover-test/1.0".to_string());
+    request.headers.insert("Host".parse::<hyper::header::HeaderName>().unwrap(), "example.com".parse::<hyper::header::HeaderValue>().unwrap());
+    request.headers.insert("User-Agent".parse::<hyper::header::HeaderName>().unwrap(), "takeover-test/1.0".parse::<hyper::header::HeaderValue>().unwrap());
     request.body = b"test body".to_vec();
     request
 }
@@ -35,7 +35,7 @@ fn create_test_http_request() -> HttpRequest {
 fn create_test_http_response() -> HttpResponse {
     let mut response = HttpResponse::new(200);
     response.status_text = Some("OK".to_string());
-    response.headers.insert("Content-Type".to_string(), "application/json".to_string());
+    response.headers.insert("Content-Type".parse::<hyper::header::HeaderName>().unwrap(), "application/json".parse::<hyper::header::HeaderValue>().unwrap());
     response.body = br#"{"message": "Hello, World!"}"#.to_vec();
     response
 }
@@ -48,7 +48,7 @@ async fn test_connection_creation_and_metadata() -> Result<()> {
     // 验证连接基本属性
     assert_eq!(connection.source_addr.port(), 12345);
     assert_eq!(connection.original_dest.port(), 80);
-    assert!(connection.id.is_empty());
+    assert!(!connection.id.is_empty());
     
     // 验证元数据
     assert_eq!(connection.metadata.protocol, "TCP");
@@ -111,7 +111,7 @@ async fn test_http_request_response_handling() -> Result<()> {
     
     // 添加HTTP请求
     let request = create_test_http_request();
-    let request_id = request.id.unwrap();
+    let request_id = request.id.clone().unwrap();
     context.request = Some(request);
     
     // 验证请求
@@ -121,7 +121,7 @@ async fn test_http_request_response_handling() -> Result<()> {
     assert_eq!(stored_request.version, "HTTP/1.1");
     assert_eq!(stored_request.headers.get("Host").unwrap(), "example.com");
     assert_eq!(stored_request.body, b"test body");
-    assert_eq!(stored_request.id.unwrap(), request_id);
+    assert_eq!(stored_request.id.as_ref().unwrap(), &request_id);
     
     // 添加HTTP响应
     let response = create_test_http_response();
@@ -150,21 +150,16 @@ async fn test_request_modifications() -> Result<()> {
     
     // 创建请求修改配置
     let modifications = RequestModifications {
-        url: Some("http://modified-example.com/test".to_string()),
-        method: Some("POST".to_string()),
-        headers: Some({
+        add_headers: Some({
             let mut headers = HashMap::new();
             headers.insert("X-Modified".to_string(), "true".to_string());
             headers
         }),
-        body: Some(b"modified body".to_vec()),
         remove_headers: Some(vec!["User-Agent".to_string()]),
-        add_query_params: Some({
-            let mut params = HashMap::new();
-            params.insert("modified".to_string(), "1".to_string());
-            params
-        }),
-        remove_query_params: Some(vec!["old_param".to_string()]),
+        modify_headers: None,
+        change_method: Some("POST".to_string()),
+        change_path: Some("/modified/test".to_string()),
+        change_body: Some("modified body".to_string()),
     };
     
     // 应用修改
@@ -173,9 +168,9 @@ async fn test_request_modifications() -> Result<()> {
     // 验证修改已被记录
     assert_eq!(context.applied_modifications.len(), 1);
     let applied = &context.applied_modifications[0];
-    assert_eq!(applied.url.as_ref().unwrap(), "http://modified-example.com/test");
-    assert_eq!(applied.method.as_ref().unwrap(), "POST");
-    assert!(applied.headers.as_ref().unwrap().contains_key("X-Modified"));
+    assert_eq!(applied.change_method.as_ref().unwrap(), "POST");
+    assert_eq!(applied.change_path.as_ref().unwrap(), "/modified/test");
+    assert!(applied.add_headers.as_ref().unwrap().contains_key("X-Modified"));
     
     println!("✅ Request modifications test passed");
     Ok(())

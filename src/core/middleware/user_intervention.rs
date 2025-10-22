@@ -681,13 +681,12 @@ impl UserInterventionMiddleware {
             ConditionExpression::HeaderValueMatches(header, pattern) => {
                 if let Some(ref request) = context.request {
                     if let Some(value) = request.headers.get(header) {
-                        self.wildcard_match(value, pattern)
-                    } else {
-                        false
+                        if let Ok(v_str) = value.to_str() {
+                            return self.wildcard_match(v_str, pattern);
+                        }
                     }
-                } else {
-                    false
                 }
+                false
             }
             ConditionExpression::StatusCodeEquals(status) => {
                 if let Some(ref response) = context.response {
@@ -1180,7 +1179,6 @@ impl Middleware for UserInterventionMiddleware {
         "user_intervention"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,

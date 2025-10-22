@@ -74,6 +74,13 @@ pub trait InboundPort: Send + Sync {
 }
 
 /// 出站端口：负责根据上下文建立到目标服务器的连接
+/// 
+/// # 全局AppCore访问
+/// 适配器可以通过`AppCore::global()`访问全局AppCore实例来获取服务：
+/// ```
+/// let app_core = AppCore::global();
+/// let tls_service = app_core.state::<TlsService>().await?;
+/// ```
 #[async_trait]
 pub trait OutboundPort: Send + Sync {
     /// 建立出站连接
@@ -87,6 +94,13 @@ pub trait OutboundPort: Send + Sync {
 }
 
 /// 控制端口：负责接收来自管理界面(UI)的命令
+/// 
+/// # 全局AppCore访问
+/// 适配器可以通过`AppCore::global()`访问全局AppCore实例来获取服务：
+/// ```
+/// let app_core = AppCore::global();
+/// let rule_service = app_core.state::<RuleService>().await?;
+/// ```
 #[async_trait]
 pub trait ControlPort: Send + Sync {
     /// 应用规则配置

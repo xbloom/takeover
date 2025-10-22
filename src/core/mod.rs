@@ -16,6 +16,7 @@ use uuid::Uuid;
 use async_trait::async_trait;
 use std::pin::Pin;
 use std::sync::atomic::AtomicBool;
+use once_cell::sync::OnceCell;
 
 // 导出子模块
 pub mod ports;
@@ -29,8 +30,8 @@ pub use model::{
     AppConfig, ConnectionId, RequestId, Connection, ConnectionContext, 
     ConnectionMetadata, HttpRequest, HttpResponse, ProcessingState,
     ConnectionStatus, ConnectionSummary, AdapterStatus, Rule, RulePattern, RuleAction,
-    RuleCondition, RequestModifications, RequestModification, ModificationType,
-    DomainEvent, ErrorCategory, RoutingAction, MergeStrategy,
+    RuleCondition, RequestModifications,
+    DomainEvent, ErrorCategory, MergeStrategy,
     InboundConfig, OutboundConfig, ScriptConfig, GeneralConfig,
     ResponseModifications, ReplayResult, CompositeRequestConfig,
     TriggerPoint, TriggerCondition, CustomEvent, LogLevel
@@ -78,6 +79,21 @@ impl ServiceContainer {
         debug!("📦 Service registered: {:?}", std::any::type_name::<T>());
     }
     
+    /// 注册已经包装在 Arc 中的服务
+    /// 
+    /// # 示例
+    /// ```rust
+    /// let container = ServiceContainer::new();
+    /// let service = Arc::new(MyService::new());
+    /// container.register_arc(service).await;
+    /// ```
+    pub async fn register_arc<T: Any + Send + Sync>(&self, service: Arc<T>) {
+        let type_id = TypeId::of::<T>();
+        let mut services = self.services.write().await;
+        services.insert(type_id, service);
+        debug!("📦 Service registered (Arc): {:?}", std::any::type_name::<T>());
+    }
+    
     /// 从容器中获取服务
     /// 
     /// # 示例
@@ -106,6 +122,22 @@ impl ServiceContainer {
         services.len()
     }
 }
+
+/// 全局AppCore单例 - 类似Tauri的全局AppHandle
+/// 
+/// 使用OnceCell实现线程安全的延迟初始化，确保整个应用程序中只有一个AppCore实例。
+/// 
+/// # 使用示例
+/// ```
+/// // 在main.rs中设置全局实例
+/// let app_core = Arc::new(AppCore::builder(...).build().await);
+/// AppCore::set_global(app_core.clone())?;
+/// 
+/// // 在任何地方访问
+/// let app_core = AppCore::global();
+/// let tls_service = app_core.state::<TlsService>().await;
+/// ```
+static GLOBAL_APP_CORE: OnceCell<Arc<AppCore>> = OnceCell::new();
 
 /// 应用核心 - 六边形架构的中心
 /// 
@@ -212,19 +244,59 @@ pub struct AppStats {
 }
 
 impl AppCore {
-    /// 创建新的应用核心实例
-    pub fn new(
-        config: AppConfig,
+    /// 设置全局AppCore实例 (类似Tauri的全局AppHandle初始化)
+    /// 
+    /// 这个方法应该在main.rs中AppCore构建后立即调用一次。
+    /// 
+    /// # 错误
+    /// 如果全局实例已经被设置过，会返回错误。
+    /// 
+    /// # 示例
+    /// ```
+    /// let app_core = Arc::new(AppCore::builder(...).build().await);
+    /// AppCore::set_global(app_core.clone())?;
+    /// ```
+    pub fn set_global(app_core: Arc<AppCore>) -> Result<(), TakeoverError> {
+        GLOBAL_APP_CORE.set(app_core)
+            .map_err(|_| TakeoverError::Config("AppCore global instance already set".to_string()))
+    }
+    
+    /// 获取全局AppCore实例 (类似Tauri的AppHandle访问)
+    /// 
+    /// 这个方法可以在应用程序的任何地方调用，无需显式传递AppCore引用。
+    /// 
+    /// # Panic
+    /// 如果全局实例未设置，会panic。确保在main.rs中先调用`set_global()`。
+    /// 
+    /// # 示例
+    /// ```
+    /// // 在任何middleware、adapter中
+    /// let app_core = AppCore::global();
+    /// let tls_service = app_core.state::<TlsService>().await?;
+    /// ```
+    pub fn global() -> &'static Arc<AppCore> {
+        GLOBAL_APP_CORE.get()
+            .expect("AppCore global instance not initialized. Call AppCore::set_global() in main.rs first.")
+    }
+    
+    /// 尝试获取全局AppCore实例 (不会panic的版本)
+    /// 
+    /// # 返回
+    /// 如果全局实例已设置，返回`Some(&Arc<AppCore>)`，否则返回`None`。
+    pub fn try_global() -> Option<&'static Arc<AppCore>> {
+        GLOBAL_APP_CORE.get()
+    }
+    
+    /// 创建新的应用核心实例 (私有，通过Builder创建)
+    fn new(
+        config: Arc<AppConfig>,
         inbound_port: Arc<dyn InboundPort>,
         outbound_port: Arc<dyn OutboundPort>,
         control_port: Arc<dyn ControlPort>,
         event_port: Arc<dyn EventPort>,
+        engine: ProcessingEngine,
     ) -> Self {
-        let config = Arc::new(config);
         let max_connections = config.general.max_connections;
-        
-        // 🔧 创建处理引擎并注册默认中间件
-        let engine = ProcessingEngine::new_with_defaults();
         
         // 🔧 创建用户管理器，使用配置中的bypass_user
         let user_manager = if let Some(ref bypass_user) = config.inbound.bypass_user {
@@ -256,23 +328,53 @@ impl AppCore {
         }
     }
     
+    /// 创建简化的应用核心实例（用于Demo和测试，低级API）
+    /// 
+    /// 这是一个公开的构造方法，供不想使用Builder模式的场景使用。
+    /// 
+    /// # 参数
+    /// - `config`: 应用配置
+    /// - `inbound_port`: 入站适配器
+    /// - `outbound_port`: 出站适配器
+    /// - `control_port`: 控制适配器
+    /// - `event_port`: 事件适配器
+    /// - `engine`: 处理引擎（需要预先配置好中间件）
+    #[deprecated(note = "Use builder instead")]
+    pub fn new_simple(
+        config: AppConfig,
+        inbound_port: Arc<dyn InboundPort>,
+        outbound_port: Arc<dyn OutboundPort>,
+        control_port: Arc<dyn ControlPort>,
+        event_port: Arc<dyn EventPort>,
+        engine: ProcessingEngine,
+    ) -> Self {
+        Self::new(
+            Arc::new(config),
+            inbound_port,
+            outbound_port,
+            control_port,
+            event_port,
+            engine,
+        )
+    }
+    
     
     /// 创建完整配置的应用核心实例（用于main.rs）
-    pub fn new_with_all_ports(
+    pub async fn new_with_all_ports(
         config: Arc<AppConfig>,
         inbound_port: Arc<dyn InboundPort>,
         outbound_port: Arc<dyn OutboundPort>,
         control_port: Arc<dyn ControlPort>,
         script_port: Arc<dyn ScriptPort>,
         api_port: Arc<dyn ApiPort>,
-        _state_manager: Arc<StateManager>,
-        _replay_manager: Arc<ReplayManager>,
+        state_manager: Arc<StateManager>,
+        replay_manager: Arc<ReplayManager>,
         middlewares: Vec<Arc<dyn crate::core::engine::Middleware>>,
     ) -> Self {
         let max_connections = config.general.max_connections;
         
         // 创建处理引擎并设置中间件
-        let mut engine = ProcessingEngine::new();
+        let engine = ProcessingEngine::new();
         for middleware in middlewares {
             engine.add_middleware(middleware);
         }
@@ -287,8 +389,16 @@ impl AppCore {
             Arc::new(UserManager::new())
         };
         
-        // 创建服务容器
+        // 创建服务容器并注册核心服务
         let services = ServiceContainer::new();
+        
+        // ✅ 注册StateManager到服务容器
+        services.register(state_manager).await;
+        info!("✅ StateManager registered to AppCore service container");
+        
+        // ✅ 注册ReplayManager到服务容器
+        services.register(replay_manager).await;
+        info!("✅ ReplayManager registered to AppCore service container");
         
         Self {
             engine: Arc::new(engine),
@@ -310,26 +420,17 @@ impl AppCore {
         }
     }
     
-    /// 设置可选的端口适配器
-    pub fn with_script_port(mut self, script_port: Arc<dyn ScriptPort>) -> Self {
-        self.script_port = Some(script_port);
-        self
+    /// 返回一个新的 AppCoreBuilder
+    pub fn builder(
+        config: AppConfig,
+        inbound: Arc<dyn InboundPort>,
+        outbound: Arc<dyn OutboundPort>,
+        control: Arc<dyn ControlPort>,
+        event: Arc<dyn EventPort>,
+    ) -> AppCoreBuilder {
+        AppCoreBuilder::new(config, inbound, outbound, control, event)
     }
     
-    pub fn with_api_port(mut self, api_port: Arc<dyn ApiPort>) -> Self {
-        self.api_port = Some(api_port);
-        self
-    }
-    
-    pub fn with_state_port(mut self, state_port: Arc<dyn StatePort>) -> Self {
-        self.state_port = Some(state_port);
-        self
-    }
-    
-    pub fn with_ui_port(mut self, ui_port: Arc<dyn UiPort>) -> Self {
-        self.ui_port = Some(ui_port);
-        self
-    }
     
     /// 获取应用配置
     pub fn config(&self) -> &Arc<AppConfig> {
@@ -423,9 +524,36 @@ impl AppCore {
     pub fn engine(&self) -> &Arc<ProcessingEngine> {
         &self.engine
     }
+
+    /// 添加中间件到处理引擎
+    pub async fn add_middleware(&self, middleware: Arc<dyn Middleware>) {
+        self.engine.add_middleware(middleware);
+    }
+    
+    /// 🎯 注册所有中间件服务（在 build() 后立即调用，不需要 sudo）
+    /// 
+    /// 分离注册和初始化两个步骤：
+    /// - register_services: 注册服务到 AppCore（不需要 sudo）
+    /// - initialize: 初始化中间件，如安装证书（可能需要 sudo）
+    pub async fn register_middleware_services(&self) -> Result<(), TakeoverError> {
+        info!("🔧 注册所有中间件服务到 AppCore...");
+        
+        let middlewares = self.engine.get_middlewares().read().unwrap().clone();
+        for mw in &middlewares {
+            if let Err(e) = mw.register_services(self).await {
+                error!("❌ 中间件 '{}' 服务注册失败: {}", mw.name(), e);
+                return Err(e);
+            }
+        }
+        
+        // 注意：全局AppCore单例已经在main.rs中通过AppCore::set_global()设置
+        // 所有组件都可以通过AppCore::global()访问
+        
+        info!("✅ 所有中间件服务注册完成");
+        Ok(())
+    }
     
     /// 主运行循环 - 启动应用核心
-    #[instrument(skip(self))]
     pub async fn run(&self) -> Result<(), TakeoverError> {
         info!("🚀 Starting AppCore");
         
@@ -436,6 +564,18 @@ impl AppCore {
                 "❌ 严重错误：创建代理用户失败：{}。\n\
                  💡 代理用户是防止回环的必需组件！\n\
                  🔧 解决方案：使用sudo权限运行以允许创建用户", e)))?;
+        
+        // 🔐 步骤2：初始化所有中间件（可能需要sudo，如TLS证书安装）
+        info!("🔧 初始化所有中间件...");
+        let middlewares = self.engine.get_middlewares().read().unwrap().clone();
+        for mw in &middlewares {
+            if let Err(e) = mw.initialize(self).await {
+                error!("❌ 中间件 '{}' 初始化失败: {}", mw.name(), e);
+                error!("💡 请确保以sudo权限运行程序（某些中间件如TLS需要安装系统证书）");
+                return Err(e);
+            }
+        }
+        info!("✅ 所有中间件初始化完成");
         
         // 设置运行状态
         self.running.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -507,7 +647,13 @@ impl AppCore {
     }
     
     /// 处理新连接
-    #[instrument(skip(self, connection))]
+    #[instrument(
+        skip(self, connection), 
+        fields(
+            conn = %connection.id, 
+            proc = %connection.metadata.process_name.as_deref().unwrap_or("unknown")
+        )
+    )]
     async fn handle_new_connection(&self, connection: Connection) -> Result<(), TakeoverError> {
         let conn_id = connection.id.clone();
         let source_addr = connection.source_addr;
@@ -590,7 +736,7 @@ impl AppCore {
         skip(self, context), 
         fields(
             conn = %context.id, 
-            proc = context.connection.metadata.process_name
+            proc = %context.connection.metadata.process_name.as_deref().unwrap_or("unknown")
         )
     )]
     async fn handle_connection_lifecycle(&self, mut context: ConnectionContext) -> Result<(), TakeoverError> {
@@ -645,7 +791,7 @@ impl AppCore {
             // 通知UI有待处理的连接
             if let Some(request) = &context.request {
                 let _ = ui_port.notify_pending_approval(
-                    request.id.unwrap_or_else(|| Uuid::new_v4()),
+                    request.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()),
                     request
                 ).await;
                 
@@ -883,6 +1029,123 @@ impl Clone for AppCore {
     }
 }
 
+/// AppCore构造器
+/// 
+/// 职责清晰的架构组装：
+/// - Engine 管理 Middlewares（处理管道）
+/// - AppCore 管理 Services（公共依赖注入容器）
+/// - Builder 负责组装和配置
+pub struct AppCoreBuilder {
+    config: Arc<AppConfig>,
+    inbound_port: Arc<dyn InboundPort>,
+    outbound_port: Arc<dyn OutboundPort>,
+    control_port: Arc<dyn ControlPort>,
+    event_port: Arc<dyn EventPort>,
+    api_port: Option<Arc<dyn ApiPort>>,
+    engine: ProcessingEngine,  // Engine 自己管理 middlewares
+    // 核心服务（将通过 manage() 注册到 AppCore）
+    services: Vec<(String, Arc<dyn Any + Send + Sync>)>,
+}
+
+impl AppCoreBuilder {
+    /// 创建一个新的 AppCoreBuilder
+    pub fn new(
+        config: AppConfig,
+        inbound: Arc<dyn InboundPort>,
+        outbound: Arc<dyn OutboundPort>,
+        control: Arc<dyn ControlPort>,
+        event: Arc<dyn EventPort>,
+    ) -> Self {
+        Self {
+            config: Arc::new(config),
+            inbound_port: inbound,
+            outbound_port: outbound,
+            control_port: control,
+            event_port: event,
+            api_port: None,
+            engine: ProcessingEngine::new(),  // 创建空引擎
+            services: Vec::new(),
+        }
+    }
+
+    /// 设置 API 端口
+    pub fn with_api_port(mut self, api_port: Arc<dyn ApiPort>) -> Self {
+        self.api_port = Some(api_port);
+        self
+    }
+    
+    /// 使用已配置的 Engine（推荐方式）
+    /// Engine 自己管理 middlewares
+    pub fn with_engine(mut self, engine: ProcessingEngine) -> Self {
+        self.engine = engine;
+        self
+    }
+    
+    /// 使用默认中间件初始化 Engine（便捷方法）
+    /// 
+    /// 🏗️ 职责：Builder负责传递配置，Engine负责创建中间件
+    /// 
+    /// # 设计原则
+    /// - Builder传递完整的AppConfig给Engine
+    /// - Engine负责创建所有中间件实例
+    /// - 每个Middleware从AppConfig中提取自己需要的配置
+    pub fn with_default_middlewares(self) -> Self {
+        // 🎯 传递完整的AppConfig，不挑选特定配置
+        let middlewares = ProcessingEngine::create_default_middlewares_with_config(&self.config);
+        
+        for middleware in middlewares {
+            self.engine.add_middleware(middleware);
+        }
+        
+        info!("✅ 默认中间件已加载 (配置从AppConfig提取)");
+        self
+    }
+    
+    /// 注册服务到 AppCore（Tauri 风格）
+    /// Service 是公共的，谁都能注册
+    pub fn manage<T: Any + Send + Sync>(mut self, service: Arc<T>) -> Self {
+        let type_name = std::any::type_name::<T>().to_string();
+        self.services.push((type_name, service as Arc<dyn Any + Send + Sync>));
+        self
+    }
+
+    /// 构建 AppCore 实例
+    pub async fn build(self) -> AppCore {
+        // 1. 创建 AppCore 实例（Engine 已经配置好了）
+        let mut app_core = AppCore::new(
+            self.config,
+            self.inbound_port,
+            self.outbound_port,
+            self.control_port,
+            self.event_port,
+            self.engine,  // Engine 自己管理 middlewares
+        );
+        
+        // 2. 设置 API 端口（如果提供）
+        app_core.api_port = self.api_port;
+
+        // 3. 注册所有服务到 AppCore（公共服务容器）
+        for (_name, service) in self.services {
+            // 使用 downcast 来注册服务
+            if let Ok(state_manager) = service.clone().downcast::<services::StateManager>() {
+                app_core.services.register_arc(state_manager).await;
+                info!("✅ StateManager registered via builder");
+            } else if let Ok(replay_manager) = service.clone().downcast::<services::ReplayManager>() {
+                app_core.services.register_arc(replay_manager).await;
+                info!("✅ ReplayManager registered via builder");
+            }
+            // 可以继续添加其他服务类型的判断
+        }
+
+        // 注意：中间件初始化推迟到 AppCore.run() 时进行
+        // 原因：某些中间件的初始化需要sudo权限（如TLS证书安装）
+        // 在 build() 时初始化太早，应该在真正启动时才初始化
+
+        app_core
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,19 +1207,19 @@ mod tests {
         }
     }
     
-    fn create_test_app_core() -> AppCore {
+    async fn create_test_app_core() -> AppCore {
         let config = AppConfig::default();
         let inbound = Arc::new(MockInboundPort);
         let outbound = Arc::new(MockOutboundPort);
         let control = Arc::new(MockControlPort);
         let event = Arc::new(MockEventPort);
         
-        AppCore::new(config, inbound, outbound, control, event)
+        AppCore::builder(config, inbound, outbound, control, event).build().await
     }
     
     #[tokio::test]
     async fn test_app_core_creation() {
-        let app_core = create_test_app_core();
+        let app_core = create_test_app_core().await;
         assert!(!app_core.is_running());
         
         let stats = app_core.get_stats().await;
@@ -966,7 +1229,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_connection_tracking() {
-        let app_core = create_test_app_core();
+        let app_core = create_test_app_core().await;
         
         // 创建测试连接
         let connection = Connection::new(

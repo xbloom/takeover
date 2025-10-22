@@ -6,9 +6,9 @@
 //! - 管理处理流程
 //! - 处理错误和异常情况
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
-use tracing::{debug, instrument};
+use tracing::{debug};
 
 use super::model::*;
 
@@ -133,7 +133,6 @@ impl Pipeline {
     
     /// 执行管道
     // #[instrument(skip(self, context, core), fields(conn = %context.id))]
-    #[instrument(skip(self, context, core))]
     pub async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -234,22 +233,41 @@ impl Default for PipelineBuilder {
 /// - 避免每个连接都重建pipeline
 pub struct ProcessingEngine {
     /// 全局middleware注册表 - 所有middleware的唯一存储位置
-    middlewares: Vec<Arc<dyn Middleware>>,
+    middlewares: RwLock<Vec<Arc<dyn Middleware>>>,
     // 注意：移除了cached_pipelines和middleware_templates字段
     // 现在采用简化架构：middleware直接注册，pipeline按需构建
 }
 
 impl ProcessingEngine {
     /// 添加中间件到全局注册表
-    pub fn add_middleware(&mut self, middleware: Arc<dyn Middleware>) {
+    pub fn add_middleware(&self, middleware: Arc<dyn Middleware>) {
         tracing::debug!("📋 注册中间件: {} (优先级: {})", middleware.name(), middleware.priority());
-        self.middlewares.push(middleware);
+        let mut middlewares = self.middlewares.write().unwrap();
+        middlewares.push(middleware);
         // 按优先级排序
-        self.middlewares.sort_by_key(|m| m.priority());
+        middlewares.sort_by_key(|m| m.priority());
+    }
+
+    /// 初始化所有中间件（注册服务和初始化）
+    pub async fn initialize_middlewares(&self, app_core: &crate::core::AppCore) -> Result<(), TakeoverError> {
+        let middlewares = self.middlewares.read().unwrap().clone();
+        for mw in &middlewares {
+            if let Err(e) = mw.register_services(app_core).await {
+                tracing::error!("Failed to register services for middleware '{}': {}", mw.name(), e);
+                return Err(e);
+            }
+        }
+        for mw in &middlewares {
+            if let Err(e) = mw.initialize(app_core).await {
+                tracing::error!("Failed to initialize middleware '{}': {}", mw.name(), e);
+                return Err(e);
+            }
+        }
+        Ok(())
     }
     
     /// 获取所有中间件（仅供调试，不推荐直接使用）
-    pub fn get_middlewares(&self) -> &Vec<Arc<dyn Middleware>> {
+    pub fn get_middlewares(&self) -> &RwLock<Vec<Arc<dyn Middleware>>> {
         &self.middlewares
     }
     
@@ -290,7 +308,8 @@ impl ProcessingEngine {
         let mut filtered_middlewares = Vec::new();
         let mut included_count = 0;
         
-        for middleware in &self.middlewares {
+        let middlewares = self.middlewares.read().unwrap();
+        for middleware in middlewares.iter() {
             if middleware.priority() >= start_priority {
                 tracing::debug!("  ✅ 包含中间件: {} (优先级: {})", middleware.name(), middleware.priority());
                 filtered_middlewares.push(Arc::clone(middleware));
@@ -309,7 +328,8 @@ impl ProcessingEngine {
     
     /// 构建默认pipeline
     fn build_default_pipeline(&self) -> Pipeline {
-        let enabled_middlewares: Vec<_> = self.middlewares
+        let middlewares = self.middlewares.read().unwrap();
+        let enabled_middlewares: Vec<_> = middlewares
             .iter()
             .filter(|m| m.enabled())
             .cloned()
@@ -326,28 +346,59 @@ impl ProcessingEngine {
     /// 创建新的处理引擎
     pub fn new() -> Self {
         Self {
-            middlewares: Vec::new(),
+            middlewares: RwLock::new(Vec::new()),
         }
     }
     
-    /// 创建默认中间件列表
+    /// 创建默认中间件列表（使用默认配置）
+    /// 
+    /// ⚠️ 已废弃：请使用 `create_default_middlewares_with_config()` 并传递配置
     /// 
     /// 只创建不需要端口依赖的核心中间件
     /// 其他需要端口的中间件在后续通过`add_middleware`添加
+    #[deprecated(note = "Use create_default_middlewares_with_config() instead")]
     pub fn create_default_middlewares() -> Vec<Arc<dyn Middleware>> {
+        use crate::core::model::AppConfig;
+        
+        // 使用默认AppConfig
+        Self::create_default_middlewares_with_config(&AppConfig::default())
+    }
+    
+    /// 创建默认中间件列表（带完整配置）
+    /// 
+    /// 🏗️ Engine职责：负责创建中间件实例
+    /// 
+    /// # 参数
+    /// - `config`: 完整的AppConfig，每个中间件自己提取需要的配置
+    /// 
+    /// # 返回
+    /// 默认中间件列表（按优先级排序）
+    /// 
+    /// # 设计原则
+    /// - Engine接收完整配置，不挑选特定配置
+    /// - 每个Middleware从config中提取自己需要的部分
+    /// - AppCore不需要知道Middleware具体配置细节
+    pub fn create_default_middlewares_with_config(config: &crate::core::model::AppConfig) -> Vec<Arc<dyn Middleware>> {
         use crate::core::middleware;
+        
+        // 🔍 调试日志：验证配置正确传递
+        tracing::debug!("🔧 Engine创建中间件 (从AppConfig提取配置)");
+        tracing::debug!("   TLS - 启用: {}, 模式: {}, 域名: {:?}", 
+            config.tls.enabled,
+            config.tls.interception_mode,
+            config.tls.intercept_domains);
         
         vec![
             // 🔍 协议检测中间件 (优先级5) - 最早执行，协议分流
             Arc::new(middleware::protocol_detection::ProtocolDetectionMiddleware::new()),
             
-            // 🔎 进程信息查询中间件 (优先级8) - 查询连接对应的进程信息
-            // Arc::new(middleware::process_info::ProcessInfoMiddleware::new()),
-            
-            // 🔐 TLS中间件 (优先级10) - 处理HTTPS拦截和ALPN协商
-            Arc::new(middleware::tls::TlsMiddleware::with_config(
-                middleware::tls::TlsMiddlewareConfig::default()
-            )),
+            // 🔐 TLS中间件 (优先级10) - 使用TLS Service架构
+            Arc::new(middleware::tls::TlsMiddleware::from_config(&config.tls)
+                .unwrap_or_else(|e| {
+                    tracing::warn!("Failed to create TLS middleware: {}, using disabled middleware", e);
+                    middleware::tls::TlsMiddleware::new()
+                })
+            ),
             
             // 🌐 HTTP/2流中间件 (优先级15) - HTTP/2协议完整生命周期
             Arc::new(middleware::http2_stream::Http2StreamMiddleware::new()),
@@ -378,10 +429,15 @@ impl ProcessingEngine {
         // - ResponseMergeMiddleware::new(api_port, config).await
     }
     
-    /// 创建带有默认中间件的新引擎
+    /// 创建带有默认中间件的新引擎（使用默认配置）
+    /// 
+    /// ⚠️ 建议：在实际项目中使用 `create_default_middlewares_with_config()` 并传递配置
     pub fn new_with_defaults() -> Self {
-        let mut engine = Self::new();
-        let default_middlewares = Self::create_default_middlewares();
+        use crate::core::model::AppConfig;
+        
+        let engine = Self::new();
+        // 使用默认AppConfig
+        let default_middlewares = Self::create_default_middlewares_with_config(&AppConfig::default());
         for middleware in default_middlewares {
             engine.add_middleware(middleware);
         }
@@ -493,17 +549,17 @@ mod tests {
     #[test]
     fn test_processing_engine_new_architecture() {
         // 测试新的简化架构
-        let mut engine = ProcessingEngine::new();
+        let engine = ProcessingEngine::new();
         
         // 验证引擎初始状态
-        assert_eq!(engine.get_middlewares().len(), 0);
+        assert_eq!(engine.get_middlewares().read().unwrap().len(), 0);
         
         // 添加几个测试middleware
         engine.add_middleware(Arc::new(TestMiddleware::new("test1")));
         engine.add_middleware(Arc::new(TestMiddleware::new("test2")));
         
         // 验证middleware被正确注册
-        assert_eq!(engine.get_middlewares().len(), 2);
+        assert_eq!(engine.get_middlewares().read().unwrap().len(), 2);
         
         // 验证pipeline可以正确创建
         let pipeline = engine.get_default_pipeline();

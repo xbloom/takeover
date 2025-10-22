@@ -370,8 +370,7 @@ impl ScriptMiddleware {
             ScriptAction::CompositeRequest(config) => {
                 if self.config.enable_composite_requests {
                     let model_config = model::CompositeRequestConfig {
-                        name: "Generated Composite Request".to_string(),
-                        requests: config.requests.into_iter().collect(),
+                        additional_requests: config.additional_requests.into_iter().map(|r| r.into()).collect(),
                         merge_strategy: config.merge_strategy.into(),
                         timeout: config.timeout,
                     };
@@ -402,7 +401,7 @@ impl ScriptMiddleware {
         config: CompositeRequestConfig,
         context: &mut ConnectionContext,
     ) -> Result<MiddlewareResult, AppError> {
-        info!("🔀 Handling composite request from '{}' with {} requests", script_name, config.requests.len());
+        info!("🔀 Handling composite request from '{}' with {} requests", script_name, config.additional_requests.len());
         
         // 更新统计
         {
@@ -411,12 +410,12 @@ impl ScriptMiddleware {
         }
         
         let start_time = Instant::now();
-        let timeout = config.timeout.unwrap_or(self.config.composite_request_timeout);
+        let timeout = Duration::from_secs(config.timeout);
         
         // 并发执行所有请求
         let mut request_futures = Vec::new();
         
-        let requests = config.requests.clone(); // 克隆请求列表
+        let requests = config.additional_requests.clone(); // 克隆请求列表
         for (index, request) in requests.iter().enumerate() {
             let api_port = Arc::clone(&self.api_port);
             let request_clone = request.clone();
@@ -424,7 +423,7 @@ impl ScriptMiddleware {
             
             let future = async move {
                 debug!("Executing composite request {} of {}", index + 1, total_requests);
-                api_port.http_request(request_clone).await
+                api_port.http_request(request_clone.into()).await
             };
             
             request_futures.push(future);
@@ -500,36 +499,30 @@ impl ScriptMiddleware {
         let mut base_response = responses[0].clone();
         
         match config.merge_strategy {
-            crate::core::model::MergeStrategy::ReplaceBody => {
+            crate::core::model::MergeStrategy::Replace => {
                 // 使用最后一个响应的body
                 if let Some(last_response) = responses.last() {
                     base_response.body = last_response.body.clone();
                 }
             }
-            crate::core::model::MergeStrategy::AppendBody => {
+            crate::core::model::MergeStrategy::Append => {
                 // 合并所有响应的body
                 let mut merged_body = Vec::new();
                 for response in &responses {
-                    merged_body.extend(&response.body);
+                    merged_body.extend_from_slice(&response.body);
                 }
                 base_response.body = merged_body;
             }
-            crate::core::model::MergeStrategy::MergeJson => {
+            crate::core::model::MergeStrategy::Merge => {
                 // 尝试合并JSON响应
                 self.merge_json_responses(&mut base_response, &responses).await?;
             }
-            crate::core::model::MergeStrategy::MergeHeaders => {
-                // 合并所有响应的头部
-                for response in &responses[1..] {
-                    base_response.headers.extend(response.headers.clone());
-                }
-            }
-            crate::core::model::MergeStrategy::CustomScript => {
+            crate::core::model::MergeStrategy::Custom(ref script_name) => {
                 // 自定义合并脚本 - 暂时使用简单合并
-                warn!("Custom script merge strategy not implemented, using append body");
+                warn!("Custom script merge strategy ('{}') not implemented, using append body", script_name);
                 let mut merged_body = Vec::new();
                 for response in &responses {
-                    merged_body.extend(&response.body);
+                    merged_body.extend_from_slice(&response.body);
                 }
                 base_response.body = merged_body;
             }
@@ -563,8 +556,8 @@ impl ScriptMiddleware {
             .map_err(|e| AppError::Config(format!("JSON merge failed: {}", e)))?;
         
         // 更新Content-Type头部
-        base_response.headers.insert("Content-Type".to_string(), "application/json".to_string());
-        base_response.headers.insert("Content-Length".to_string(), base_response.body.len().to_string());
+        base_response.headers.insert("content-type", "application/json".parse().unwrap());
+        base_response.headers.insert("content-length", base_response.body.len().to_string().parse().unwrap());
         
         Ok(())
     }
@@ -595,7 +588,6 @@ impl Middleware for ScriptMiddleware {
         "script"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,

@@ -2,22 +2,77 @@
 //! 
 //! 定义系统中的核心数据结构和业务实体
 
+use crate::utils::generate_short_connection_id;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::time::{Duration, SystemTime};
 use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
-use uuid::Uuid;
+use std::time::{Duration, SystemTime};
 use tokio::net::TcpStream;
-use tokio_rustls::{server::TlsStream as InboundTlsStream};
-use tokio_rustls::{client::TlsStream as OutboundTlsStream};
+use tokio_rustls::{client::TlsStream as OutboundTlsStream, server::TlsStream as InboundTlsStream};
+use uuid::Uuid;
+use hyper::HeaderMap;
 
+// HeaderMap 序列化辅助模块
+// 📝 注意：序列化主要用于日志/调试，运行时处理使用 HeaderMap.append() 保留所有多值头部
+mod headermap_serde {
+    use super::*;
+    use serde::{Deserializer, Serializer};
+    use serde::ser::SerializeMap;
+    use std::collections::HashMap;
+    
+    pub fn serialize<S>(headers: &HeaderMap, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // 简单序列化：遍历所有头部（包括重复的）
+        let mut map = serializer.serialize_map(None)?;
+        for (key, value) in headers.iter() {
+            if let Ok(v) = value.to_str() {
+                map.serialize_entry(key.as_str(), v)?;
+            }
+        }
+        map.end()
+    }
+    
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HeaderMap, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let map: HashMap<String, serde_json::Value> = HashMap::deserialize(deserializer)?;
+        let mut headers = HeaderMap::new();
+        
+        for (key, value) in map {
+            if let Ok(name) = key.parse::<hyper::header::HeaderName>() {
+                match value {
+                    serde_json::Value::String(s) => {
+                        if let Ok(val) = s.parse::<hyper::header::HeaderValue>() {
+                            headers.insert(name, val);
+                        }
+                    }
+                    serde_json::Value::Array(arr) => {
+                        // 支持数组格式（多值头部）
+                        for item in arr {
+                            if let serde_json::Value::String(s) = item {
+                                if let Ok(val) = s.parse::<hyper::header::HeaderValue>() {
+                                    headers.append(name.clone(), val);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(headers)
+    }
+}
 
 /// 连接ID类型 - 使用Sqids生成的短ID
 pub type ConnectionId = String;
 
-/// 请求ID类型  
-pub type RequestId = Uuid;
+/// 请求ID类型
+pub type RequestId = String;
 
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -249,6 +304,8 @@ pub struct ConnectionMetadata {
     pub process_name: Option<String>,
     /// 用户ID
     pub user_id: Option<u32>,
+    /// 用户名
+    pub user_name: Option<String>,
     /// 创建时间
     pub created_at: SystemTime,
     /// 自定义数据
@@ -260,6 +317,7 @@ impl Default for ConnectionMetadata {
         Self {
             protocol: "TCP".to_string(), // 默认协议为TCP
             process_name: None,
+            user_name: None,
             user_id: None,
             created_at: SystemTime::now(),
             custom_data: HashMap::new(),
@@ -376,8 +434,9 @@ pub struct HttpRequest {
     pub url: String,
     /// HTTP版本
     pub version: String,
-    /// 头部
-    pub headers: HashMap<String, String>,
+    /// 头部 (支持多值头部，如 Set-Cookie)
+    #[serde(with = "headermap_serde")]
+    pub headers: HeaderMap,
     /// 请求体
     pub body: Vec<u8>,
     /// 发送时间
@@ -387,11 +446,11 @@ pub struct HttpRequest {
 impl HttpRequest {
     pub fn new(method: &str, url: &str) -> Self {
         Self {
-            id: Some(Uuid::new_v4()),
+            id: Some(Uuid::new_v4().to_string()),
             method: method.to_string(),
             url: url.to_string(),
             version: "HTTP/1.1".to_string(),
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
             body: Vec::new(),
             sent_at: None,
         }
@@ -407,8 +466,9 @@ pub struct HttpResponse {
     pub status_code: u16,
     /// 状态文本
     pub status_text: Option<String>,
-    /// 头部
-    pub headers: HashMap<String, String>,
+    /// 头部 (支持多值头部，如 Set-Cookie)
+    #[serde(with = "headermap_serde")]
+    pub headers: HeaderMap,
     /// 响应体
     pub body: Vec<u8>,
     /// 发送时间
@@ -421,7 +481,7 @@ impl HttpResponse {
             id: Some(Uuid::new_v4()),
             status_code,
             status_text: None,
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
             body: Vec::new(),
             sent_at: None,
         }
@@ -491,42 +551,30 @@ pub struct AdapterStatus {
     pub errors: u64,
 }
 
-/// 规则
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// =======================================================================
+// Phase 2: 完整版规则数据模型 (V3 Design)
+// =======================================================================
+
+/// 规则定义 - 完整版本
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Rule {
-    /// 规则ID
-    pub id: Uuid,
-    /// 规则名称
+    pub id: String,  // 使用 utils::generate_short_connection_id()
     pub name: String,
-    /// 规则描述
     pub description: String,
-    /// 匹配模式 (主要匹配条件)
     pub pattern: RulePattern,
-    /// 匹配条件
     pub conditions: Vec<RuleCondition>,
-    /// 动作
     pub action: RuleAction,
-    /// 是否启用
     pub enabled: bool,
-    /// 优先级
-    pub priority: u32,
-    /// 元数据
+    pub priority: i32,
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl Rule {
-    /// 创建新规则
-    pub fn new<T: Into<String>>(
-        name: T,
-        description: T,
-        pattern: RulePattern,
-        action: RuleAction,
-        priority: u32,
-    ) -> Self {
+    pub fn new(name: &str, description: &str, pattern: RulePattern, action: RuleAction, priority: i32) -> Self {
         Self {
-            id: Uuid::new_v4(),
-            name: name.into(),
-            description: description.into(),
+            id: generate_short_connection_id(),  // 使用现有工具方法
+            name: name.to_string(),
+            description: description.to_string(),
             pattern,
             conditions: Vec::new(),
             action,
@@ -536,138 +584,251 @@ impl Rule {
         }
     }
     
-    /// 添加匹配条件
-    pub fn with_condition(mut self, condition: RuleCondition) -> Self {
-        self.conditions.push(condition);
-        self
-    }
-    
-    /// 设置启用状态
-    pub fn with_enabled(mut self, enabled: bool) -> Self {
-        self.enabled = enabled;
-        self
-    }
-    
-    /// 添加元数据
-    pub fn with_metadata(mut self, key: String, value: serde_json::Value) -> Self {
-        self.metadata.insert(key, value);
-        self
+    /// 便捷构造器 - 兼容现有代码
+    pub fn simple(name: &str, pattern: RulePattern, action: RuleAction, priority: i32) -> Self {
+        Self::new(name, name, pattern, action, priority)
     }
 }
 
-/// 规则模式
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 规则匹配模式 - 完整版本
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RulePattern {
-    HostMatches(String),
-    PathMatches(String),
-    HeaderExists(String),
-    HeaderValueMatches { header: String, value: String },
-    PortMatches(u16),
-    ProcessMatches(String),
-    And(Vec<RulePattern>),
-    Or(Vec<RulePattern>),
-    Custom(String), // Lua表达式
+    // 基础匹配
+    HostMatches(String),              // 主机匹配：*.google.com
+    PathMatches(String),              // 路径匹配：/api/*
+    HeaderExists(String),             // 请求头存在：Authorization
+    HeaderValueMatches {
+        header: String,
+        value: String
+    },                                // 请求头值匹配：User-Agent: *Chrome*
+    PortMatches(u16),                 // 端口匹配：443
+    ProcessMatches(String),           // 进程匹配：*curl*
+    UserMatches(String),              // 用户匹配：john
+    
+    // 时间匹配
+    TimeRange {
+        start: String,                // HH:MM 格式：09:00
+        end: String                   // HH:MM 格式：17:00
+    },
+    WeekdayMatches(Vec<u8>),         // 星期几：[1,2,3,4,5] (Mon-Fri)
+    
+    // 复合匹配
+    And(Vec<RulePattern>),           // 逻辑与
+    Or(Vec<RulePattern>),            // 逻辑或
+    Not(Box<RulePattern>),           // 逻辑非
+    
+    // 高级匹配
+    Custom(String),                  // 自定义Lua脚本匹配
 }
 
-/// 规则动作
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// 规则条件 - 补充匹配条件
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuleCondition {
+    pub name: String,
+    pub condition_type: RuleConditionType,
+    pub value: serde_json::Value,
+    pub negated: bool,  // 是否取反
+}
+
+/// 规则条件类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum RuleConditionType {
+    // 网络条件
+    SourceIPInRange,     // 源IP范围
+    TargetIPInRange,     // 目标IP范围
+    ConnectionCount,     // 连接数量限制
+    BandwidthUsage,      // 带宽使用情况
+    
+    // 请求条件
+    RequestSize,         // 请求大小
+    RequestMethod,       // HTTP方法
+    ContentType,         // Content-Type
+    
+    // 应用条件
+    ProcessPID,          // 进程PID
+    ProcessParent,       // 父进程
+    ProcessCPUUsage,     // CPU使用率
+    ProcessMemoryUsage,  // 内存使用率
+    
+    // 自定义条件
+    CustomScript,        // 自定义脚本
+}
+
+/// 规则动作 - 完整版本
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RuleAction {
-    Allow,
-    Block,
-    Direct,
-    Proxy(crate::config::ProxyConfig),
-    /// 使用代理名称标识的代理动作（推荐使用）
-    ProxyByName(String),
-    ModifyRequest(RequestModifications),
-    ModifyResponse(Vec<RequestModification>),
-    InterceptForApproval,
-    ExecuteScript(String),
-    Log(LogLevel),
-}
-
-/// 规则条件
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RuleCondition {
-    /// 域名匹配
-    Domain(String),
-    /// 端口匹配
-    Port(u16),
-    /// URL模式匹配
-    UrlPattern(String),
-    /// 进程路径匹配
-    ProcessPath(String),
-    /// IP范围匹配
-    IpRange(String),
-}
-
-/// 路由动作
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RoutingAction {
-    /// 允许
-    Allow,
-    /// 拒绝
-    Deny,
-    /// 重定向
-    Redirect(String),
-    /// 修改
-    Modify(Vec<RequestModification>),
-    /// 脚本处理
-    Script(String),
+    // 基础动作
+    Allow,                           // 允许通过 (无修改)
+    Direct,                          // 直连
+    Block,                           // 拒绝连接
+    ProxyByName(String),            // 通过指定代理
+    
+    // 修改动作
+    ModifyRequest(RequestModifications),      // 修改请求
+    ModifyResponse(ResponseModifications),    // 修改响应
+    RedirectTo(String),                       // 重定向到指定URL
+    
+    // 交互动作
+    InterceptForApproval,            // 拦截等待人工批准
+    PauseForInspection(u64),        // 暂停指定秒数供检查
+    
+    // 脚本动作
+    ExecuteScript(String),           // 执行指定脚本
+    CompositeRequest(CompositeRequestConfig), // 复合请求处理
+    
+    // 日志动作
+    Log(LogLevel),                   // 记录日志
+    Alert(AlertConfig),             // 发送告警
+    
+    // 自定义动作
+    Custom(HashMap<String, serde_json::Value>),
 }
 
 /// 请求修改配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct RequestModifications {
-    pub url: Option<String>,
-    pub method: Option<String>,
-    pub headers: Option<HashMap<String, String>>,
-    pub body: Option<Vec<u8>>,
+    pub add_headers: Option<HashMap<String, String>>,
     pub remove_headers: Option<Vec<String>>,
-    pub add_query_params: Option<HashMap<String, String>>,
-    pub remove_query_params: Option<Vec<String>>,
+    pub modify_headers: Option<HashMap<String, String>>,
+    pub change_method: Option<String>,
+    pub change_path: Option<String>,
+    pub change_body: Option<String>,
 }
 
-/// 请求修改
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RequestModification {
-    /// 修改类型
-    pub modification_type: ModificationType,
-    /// 目标字段
-    pub target: String,
-    /// 新值
-    pub value: String,
+/// 响应修改配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct ResponseModifications {
+    pub change_status: Option<u16>,
+    pub add_headers: Option<HashMap<String, String>>,
+    pub remove_headers: Option<Vec<String>>,
+    pub modify_headers: Option<HashMap<String, String>>,
+    pub change_body: Option<String>,
 }
 
-/// 修改类型
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ModificationType {
-    /// 设置头部
-    SetHeader,
-    /// 移除头部
-    RemoveHeader,
-    /// 设置URL参数
-    SetUrlParam,
-    /// 移除URL参数
-    RemoveUrlParam,
-    /// 替换URL
-    ReplaceUrl,
-    /// 替换主机
-    ReplaceHost,
+/// 复合请求配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompositeRequestConfig {
+    pub additional_requests: Vec<HttpRequestConfig>,
+    pub merge_strategy: MergeStrategy,
+    pub timeout: u64, // 秒
+}
+
+/// HTTP请求配置 (用于复合请求)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HttpRequestConfig {
+    pub url: String,
+    pub method: String,
+    pub headers: HashMap<String, String>,
+    pub body: Option<String>,
+}
+
+impl From<HttpRequestConfig> for HttpRequest {
+    fn from(config: HttpRequestConfig) -> Self {
+        let mut headers = HeaderMap::new();
+        for (k, v) in config.headers {
+            if let (Ok(name), Ok(val)) = (k.parse::<hyper::header::HeaderName>(), v.parse::<hyper::header::HeaderValue>()) {
+                headers.insert(name, val);
+            }
+        }
+        
+        Self {
+            id: Some(Uuid::new_v4().to_string()),
+            method: config.method,
+            url: config.url,
+            version: "HTTP/1.1".to_string(), // Default version
+            headers,
+            body: config.body.unwrap_or_default().into_bytes(),
+            sent_at: None,
+        }
+    }
 }
 
 /// 合并策略
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MergeStrategy {
-    /// 替换响应体
-    ReplaceBody,
-    /// 追加响应体
-    AppendBody,
-    /// JSON合并
-    MergeJson,
-    /// 仅合并头部
-    MergeHeaders,
-    /// 自定义脚本
-    CustomScript,
+    Replace,           // 使用新响应替换
+    Merge,            // 合并响应内容
+    Append,           // 追加到原响应
+    Custom(String),   // 自定义合并脚本
+}
+
+/// 日志级别
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// 告警配置
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AlertConfig {
+    pub alert_type: AlertType,
+    pub message: String,
+    pub severity: AlertSeverity,
+    pub channels: Vec<String>, // 告警渠道：email, slack, webhook等
+}
+
+/// 告警类型
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AlertType {
+    SecurityThreat,
+    PerformanceIssue,
+    PolicyViolation,
+    SystemAnomaly,
+    Custom(String),
+}
+
+/// 告警严重级别
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AlertSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+/// 匹配结果 - 完整版本
+#[derive(Debug, Clone)]
+pub struct MatchResult {
+    pub rule_id: String,
+    pub rule_name: String,
+    pub rule_description: String,
+    pub action: RuleAction,
+    pub match_duration: Duration,
+    pub matched_patterns: Vec<String>, // 哪些模式匹配了
+    pub matched_conditions: Vec<String>, // 哪些条件匹配了
+}
+
+/// 规则编译缓存 - 性能优化
+#[derive(Debug)]
+pub struct CompiledRule {
+    pub rule: Rule,
+    pub compiled_patterns: Vec<CompiledPattern>,
+    pub compiled_at: SystemTime,
+}
+
+/// 预编译的匹配模式 - 性能优化
+#[derive(Debug)]
+pub struct CompiledPattern {
+    pub original_pattern: RulePattern,
+    pub regex: Option<regex::Regex>,
+    pub glob: Option<globset::Glob>,
+    pub exact_match: Option<String>,
+    pub pattern_type: PatternType,
+}
+
+/// 模式类型分级 - 用于性能优化
+#[derive(Debug, PartialEq, Ord, PartialOrd, Eq)]
+pub enum PatternType {
+    Exact,      // 精确匹配 - 最快
+    Prefix,     // 前缀匹配 - 快
+    Suffix,     // 后缀匹配 - 快
+    Wildcard,   // 通配符匹配 - 中等
+    Regex,      // 正则表达式 - 慢
+    Composite,  // 复合模式 (And/Or/Not) - 最慢
+    Custom,     // 自定义脚本 - 很慢
 }
 
 /// 领域事件
@@ -727,17 +888,9 @@ pub enum ErrorCategory {
     System,
 }
 
-// RequestModifications 已在前面定义，删除重复定义
-
-/// 响应修改配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResponseModifications {
-    /// 修改列表
-    pub modifications: Vec<RequestModification>, // 重用相同的修改类型
-}
 
 /// 重放结果
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReplayResult {
     /// 请求ID
     pub request_id: RequestId,
@@ -751,19 +904,6 @@ pub struct ReplayResult {
     pub response: Option<HttpResponse>,
     /// 错误消息
     pub error_message: Option<String>,
-}
-
-/// 复合请求配置
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompositeRequestConfig {
-    /// 配置名称
-    pub name: String,
-    /// 请求序列
-    pub requests: Vec<HttpRequest>,
-    /// 合并策略
-    pub merge_strategy: MergeStrategy,
-    /// 执行超时
-    pub timeout: Option<Duration>,
 }
 
 /// 触发点
@@ -809,19 +949,6 @@ pub struct CustomEvent {
     pub data: HashMap<String, serde_json::Value>,
     /// 时间戳
     pub timestamp: SystemTime,
-}
-
-/// 日志级别
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum LogLevel {
-    /// 调试
-    Debug,
-    /// 信息
-    Info,
-    /// 警告
-    Warn,
-    /// 错误
-    Error,
 }
 
 impl Default for AppConfig {

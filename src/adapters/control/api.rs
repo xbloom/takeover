@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::sync::RwLock;
-use tracing::{info, error, debug, instrument};
+use tracing::{info, error, debug, warn, instrument};
 use async_trait::async_trait;
 use serde::{Serialize, Deserialize};
 
@@ -21,6 +21,13 @@ use crate::core::model::{ConnectionId, RequestId};
 /// 2. 处理客户端的管理请求
 /// 3. 返回JSON格式的响应
 /// 4. 支持实时连接监控
+/// 
+/// # 全局AppCore访问
+/// 使用`AppCore::global()`访问全局AppCore单例，无需手动注入：
+/// ```
+/// let app_core = AppCore::global();
+/// let rule_service = app_core.state::<RuleService>().await;
+/// ```
 pub struct RestControlAdapter {
     /// 监听地址
     listen_addr: SocketAddr,
@@ -39,7 +46,7 @@ pub struct RestControlAdapter {
 #[derive(Debug, Clone)]
 struct InterceptedConnection {
     connection_id: ConnectionId,
-    request_id: RequestId,
+    request_id: String,
     intercepted_at: std::time::SystemTime,
     status: InterceptionStatus,
     request_data: Option<Vec<u8>>,
@@ -57,7 +64,7 @@ enum InterceptionStatus {
 
 /// API统计信息
 #[derive(Debug, Default, Clone)]
-struct ApiStats {
+pub struct ApiStats {
     total_requests: u64,
     successful_requests: u64,
     failed_requests: u64,
@@ -90,6 +97,7 @@ struct RuleRequest {
 
 /// 拦截决策请求
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct InterceptionDecisionRequest {
     decision: String, // "approve", "reject", "modify"
     modifications: Option<RequestModifications>,
@@ -98,6 +106,7 @@ struct InterceptionDecisionRequest {
 
 /// 重放请求
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct ReplayRequest {
     modifications: RequestModifications,
 }
@@ -113,6 +122,7 @@ impl RestControlAdapter {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
+    
     
     /// 启动API服务器
     pub async fn start(&self) -> Result<(), AppError> {
@@ -189,8 +199,20 @@ impl RestControlAdapter {
         active_rules.clear();
         
         // 添加新规则
-        for rule in request.rules {
+        for rule in request.rules.clone() {
             active_rules.insert(rule.id.to_string(), rule);
+        }
+        
+        // 🎯 自动同步规则到 RuleService (通过全局AppCore)
+        use crate::core::middleware::rule_matching::RuleService;
+        let app_core: &'static Arc<crate::AppCore> = crate::core::AppCore::global();
+        if let Some(rule_service) = app_core.state::<RuleService>().await {
+            debug!("🔄 自动同步 {} 条规则到 RuleService", request.rules.len());
+            rule_service.apply_rules(request.rules).await
+                .map_err(|e| AppError::Config(format!("Failed to sync rules to RuleService: {}", e)))?;
+            info!("✅ 规则已自动同步到 RuleService");
+        } else {
+            warn!("⚠️ RuleService not found in AppCore");
         }
         
         self.update_success_stats().await;
@@ -212,7 +234,7 @@ impl RestControlAdapter {
     /// 处理拦截决策请求
     async fn handle_interception_decision(
         &self,
-        request_id: RequestId,
+        request_id: &RequestId,
         decision: InterceptionDecisionRequest,
     ) -> Result<ApiResponse<String>, AppError> {
         debug!("Handling interception decision for request {}: {}", request_id, decision.decision);
@@ -220,7 +242,7 @@ impl RestControlAdapter {
         let mut intercepted = self.intercepted_connections.write().await;
         
         if let Some(connection) = intercepted.values_mut()
-            .find(|c| c.request_id == request_id) {
+            .find(|c| c.request_id == *request_id) {
             
             connection.status = match decision.decision.as_str() {
                 "approve" => InterceptionStatus::Approved,
@@ -295,15 +317,15 @@ impl ControlPort for RestControlAdapter {
         
         // 转换端口Rules到模型Rules
         let model_rules: Vec<model::Rule> = rules.into_iter().map(|r| model::Rule {
-            id: uuid::Uuid::new_v4(),
+            id: r.id,
             name: r.name,
-            description: "Rule description".to_string(), // 默认描述
+            description: r.description,
             pattern: r.pattern.into(),
-            conditions: vec![], // 默认空条件
+            conditions: r.conditions.into_iter().map(|c| c.into()).collect(),
             action: r.action.into(),
             enabled: r.enabled,
             priority: r.priority,
-            metadata: HashMap::new(), // 默认空metadata
+            metadata: r.metadata,
         }).collect();
         let request = RuleRequest { rules: model_rules };
         match self.handle_apply_rules(request).await {
@@ -344,7 +366,7 @@ impl ControlPort for RestControlAdapter {
         
         let intercepted_connection = InterceptedConnection {
             connection_id: conn_id.clone(),
-            request_id: uuid::Uuid::new_v4(),
+            request_id: uuid::Uuid::new_v4().to_string(),
             intercepted_at: std::time::SystemTime::now(),
             status: InterceptionStatus::Pending,
             request_data: None,
@@ -376,9 +398,9 @@ impl ControlPort for RestControlAdapter {
             reason: None,
         };
         
-        match self.handle_interception_decision(request_id, decision).await {
+        match self.handle_interception_decision(&request_id, decision).await {
             Ok(response) if response.success => {
-                info!("✅ Request {} approved", request_id);
+                info!("✅ Request {} approved", &request_id);
                 Ok(())
             }
             Ok(response) => {
@@ -400,9 +422,9 @@ impl ControlPort for RestControlAdapter {
             reason: Some(reason.clone()),
         };
         
-        match self.handle_interception_decision(request_id, decision).await {
+        match self.handle_interception_decision(&request_id, decision).await {
             Ok(response) if response.success => {
-                info!("✅ Request {} rejected: {}", request_id, reason);
+                info!("✅ Request {} rejected: {}", &request_id, reason);
                 Ok(())
             }
             Ok(response) => {
@@ -418,14 +440,14 @@ impl ControlPort for RestControlAdapter {
     async fn trigger_replay(
         &self,
         request_id: RequestId,
-        modifications: RequestModifications,
+        _modifications: RequestModifications,
     ) -> Result<ReplayResult, AppError> {
         debug!("Triggering replay for request {} via REST adapter", request_id);
         
         // 在实际实现中，这里会触发请求重放
         // 目前返回一个模拟的结果
         let result = ReplayResult {
-            request_id: request_id,
+            request_id: request_id.to_string(),
             replay_count: 1,
             execution_time: std::time::Duration::from_millis(100),
             success: true,
@@ -459,11 +481,12 @@ impl Default for RestControlAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::{RulePattern, RuleAction};
+    use crate::core::ports;
+    use std::collections::HashMap;
     
     #[tokio::test]
     async fn test_adapter_creation() {
-        let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:18081".parse().unwrap();
         let adapter = RestControlAdapter::new(addr);
         
         assert_eq!(adapter.listen_addr, addr);
@@ -474,30 +497,34 @@ mod tests {
     async fn test_rule_application() {
         let adapter = RestControlAdapter::default();
         
-        let rules = vec![
-            Rule::new(
-                "test_rule_1",
-                "Test Rule 1",
-                RulePattern::HostMatches("example.com".to_string()),
-                RuleAction::Allow,
-                100,
-            ),
+        let rules_to_apply = vec![
+            ports::Rule {
+                id: "test-rule-1".to_string(),
+                name: "test_rule_1".to_string(),
+                description: "Test Rule 1".to_string(),
+                pattern: ports::RulePattern::HostMatches("example.com".to_string()),
+                conditions: vec![],
+                action: ports::RuleAction::Allow,
+                enabled: true,
+                priority: 100,
+                metadata: HashMap::new(),
+            },
         ];
         
-        let result = adapter.apply_rules(rules).await;
+        let result = adapter.apply_rules(rules_to_apply).await;
         assert!(result.is_ok());
         
         let active_rules = adapter.get_active_rules().await.unwrap();
         assert_eq!(active_rules.len(), 1);
-        assert_eq!(active_rules[0].id, "test_rule_1");
+        assert_eq!(active_rules[0].name, "test_rule_1");
     }
     
     #[tokio::test]
     async fn test_connection_interception() {
         let adapter = RestControlAdapter::default();
-        let conn_id = uuid::Uuid::new_v4();
+        let conn_id = uuid::Uuid::new_v4().to_string();
         
-        let result = adapter.intercept_connection(conn_id.to_string()).await;
+        let result = adapter.intercept_connection(conn_id.clone()).await;
         assert!(result.is_ok());
         
         let intercepted = adapter.intercepted_connections.read().await;

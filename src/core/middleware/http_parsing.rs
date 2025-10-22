@@ -419,7 +419,6 @@ impl Middleware for HttpParsingMiddleware {
         "http_parsing"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,

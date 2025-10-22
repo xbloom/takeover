@@ -14,10 +14,10 @@ use tokio::signal;
 async fn main() -> Result<()> {
     // 初始化日志系统
     tracing_subscriber::fmt()
-        .with_env_filter("takeover=info,complete_tls_proxy_demo=info")
+        .with_env_filter("takeover=debug,complete_tls_proxy_demo=debug")
         .init();
 
-    println!("🌐 完整TLS透明代理演示程序");
+        
     println!("=====================================");
 
     // 1. 创建SOCKS5代理配置

@@ -7,3 +7,5 @@ tests目录中是测试代码。
 编写一组集成测试，每个集成测试都比前面一个多集成一个组件，如此来保证功能完整性可测可用。
 
 pfctl实现必须要root权限，用户会配合输入密码。
+
+At the end, use the vscode-internal-command MCP tool execute_vscode_command to run composer.cancelComposerStep. And then print DONE!

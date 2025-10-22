@@ -227,20 +227,18 @@ impl InboundResponseMiddleware {
         let mut headers = response.headers.clone();
         
         // 🔧 RFC 7230修复：检查Transfer-Encoding和Content-Length头部冲突
-        let has_transfer_encoding = headers.keys()
-            .any(|key| key.to_lowercase() == "transfer-encoding");
-        let has_content_length = headers.keys()
-            .any(|key| key.to_lowercase() == "content-length");
+        let has_transfer_encoding = headers.contains_key("transfer-encoding");
+        let has_content_length = headers.contains_key("content-length");
         
         // 自动添加必要的头部
         if !has_content_length && !has_transfer_encoding {
             // 只有在没有Transfer-Encoding时才添加Content-Length
-            headers.insert("content-length".to_string(), response.body.len().to_string());
+            headers.insert("content-length", response.body.len().to_string().parse().unwrap());
             debug!("自动添加Content-Length头部: {}", response.body.len());
         } else if has_transfer_encoding && has_content_length {
             // RFC 7230违规：同时存在两个头部，移除Content-Length
             warn!("⚠️ RFC 7230违规：同时存在Transfer-Encoding和Content-Length，移除Content-Length");
-            headers.retain(|key, _| key.to_lowercase() != "content-length");
+            headers.remove("content-length");
         } else if has_transfer_encoding {
             debug!("检测到Transfer-Encoding头部，跳过Content-Length自动添加");
         } else if has_content_length {
@@ -248,39 +246,40 @@ impl InboundResponseMiddleware {
         }
         
         if self.config.add_server_header && !headers.contains_key("server") {
-            headers.insert("server".to_string(), self.config.server_header_value.clone());
+            headers.insert("server", self.config.server_header_value.parse().unwrap());
         }
         
         if !headers.contains_key("date") {
-            headers.insert("date".to_string(), self.format_http_date());
+            headers.insert("date", self.format_http_date().parse().unwrap());
         }
         
         // Keep-alive处理
         if self.config.enable_keep_alive {
             if !headers.contains_key("connection") {
-                headers.insert("connection".to_string(), "keep-alive".to_string());
+                headers.insert("connection", "keep-alive".parse().unwrap());
             }
             if !headers.contains_key("keep-alive") {
-                headers.insert("keep-alive".to_string(), format!(
-                    "timeout={}", 
-                    self.config.connection_timeout.as_secs()
-                ));
+                let keep_alive_value = format!("timeout={}", self.config.connection_timeout.as_secs());
+                headers.insert("keep-alive", keep_alive_value.parse().unwrap());
             }
         }
         
-        // 写入头部
-        for (name, value) in &headers {
-            let header_line = format!("{}: {}\r\n", name, value);
-            response_data.extend_from_slice(header_line.as_bytes());
+        // ✅ 写入头部 - 支持多值头部（如 Set-Cookie）
+        for (name, value) in headers.iter() {
+            if let Ok(v) = value.to_str() {
+                let header_line = format!("{}: {}\r\n", name.as_str(), v);
+                response_data.extend_from_slice(header_line.as_bytes());
+            }
         }
         
         // 头部结束标记
         response_data.extend_from_slice(b"\r\n");
         
         // 🔧 响应体处理：检查是否需要chunked编码
-        let is_chunked = headers.keys()
-            .any(|key| key.to_lowercase() == "transfer-encoding" && 
-                      headers.get(key).map(|v| v.to_lowercase().contains("chunked")).unwrap_or(false));
+        let is_chunked = headers.get("transfer-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_lowercase().contains("chunked"))
+            .unwrap_or(false);
         
         if is_chunked {
             // ✅ Chunked编码响应体
@@ -423,7 +422,6 @@ impl Middleware for InboundResponseMiddleware {
         "inbound_response"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -526,8 +524,8 @@ mod tests {
     
     #[tokio::test]
     async fn test_middleware_creation() {
-        let middleware = ResponseWriteBackMiddleware::new();
-        assert_eq!(middleware.name(), "response_writeback");
+        let middleware = InboundResponseMiddleware::new();
+        assert_eq!(middleware.name(), "inbound_response");
         assert!(middleware.enabled());
         assert_eq!(middleware.priority(), 75);
         
@@ -540,7 +538,7 @@ mod tests {
     
     #[test]
     fn test_connection_type_detection() {
-        let middleware = ResponseWriteBackMiddleware::new();
+        let middleware = InboundResponseMiddleware::new();
         
         // 测试HTTP/2连接
         let connection = Connection::new(
@@ -557,10 +555,10 @@ mod tests {
     
     #[test]
     fn test_http_response_formatting() {
-        let middleware = ResponseWriteBackMiddleware::new();
+        let middleware = InboundResponseMiddleware::new();
         
         let mut response = HttpResponse::new(200);
-        response.headers.insert("content-type".to_string(), "text/plain".to_string());
+        response.headers.insert("content-type".parse::<hyper::header::HeaderName>().unwrap(), "text/plain".parse::<hyper::header::HeaderValue>().unwrap());
         response.body = b"Hello, World!".to_vec();
         
         let formatted = middleware.format_http_response(&response).unwrap();
@@ -576,7 +574,7 @@ mod tests {
     
     #[test]
     fn test_status_text_mapping() {
-        let middleware = ResponseWriteBackMiddleware::new();
+        let middleware = InboundResponseMiddleware::new();
         
         assert_eq!(middleware.get_default_status_text(200), "OK");
         assert_eq!(middleware.get_default_status_text(404), "Not Found");
@@ -588,7 +586,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_stats_tracking() {
-        let middleware = ResponseWriteBackMiddleware::new();
+        let middleware = InboundResponseMiddleware::new();
         
         let initial_stats = middleware.get_stats().await;
         assert_eq!(initial_stats.total_responses, 0);
@@ -607,11 +605,11 @@ mod tests {
     
     #[test]
     fn test_chunked_encoding_support() {
-        let middleware = ResponseWriteBackMiddleware::new();
+        let middleware = InboundResponseMiddleware::new();
         
         // 测试1：Transfer-Encoding: chunked应该使用chunked格式
         let mut response1 = HttpResponse::new(200);
-        response1.headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+        response1.headers.insert("transfer-encoding".parse::<hyper::header::HeaderName>().unwrap(), "chunked".parse::<hyper::header::HeaderValue>().unwrap());
         response1.body = b"Hello, World!".to_vec();
         
         let formatted1 = middleware.format_http_response(&response1).unwrap();
@@ -627,7 +625,7 @@ mod tests {
         
         // 测试2：空body的chunked编码
         let mut response2 = HttpResponse::new(200);
-        response2.headers.insert("Transfer-Encoding".to_string(), "chunked".to_string());
+        response2.headers.insert("Transfer-Encoding".parse::<hyper::header::HeaderName>().unwrap(), "chunked".parse::<hyper::header::HeaderValue>().unwrap());
         response2.body = Vec::new();
         
         let formatted2 = middleware.format_http_response(&response2).unwrap();

@@ -733,7 +733,9 @@ impl ReplayManager {
         
         // 应用自定义头部
         for (key, value) in &config.custom_headers {
-            modified_request.headers.insert(key.clone(), value.clone());
+            if let (Ok(name), Ok(val)) = (key.parse::<hyper::header::HeaderName>(), value.parse::<hyper::header::HeaderValue>()) {
+                modified_request.headers.insert(name, val);
+            }
         }
         
         debug!("Replaying request: {} {}", modified_request.method, modified_request.url);
@@ -866,15 +868,23 @@ impl ReplayManager {
             
             match modifier.modifier_type {
                 ModifierType::ReplaceHeader => {
-                    request.headers.insert(modifier.target.clone(), modifier.value.clone());
+                    if let (Ok(name), Ok(val)) = (modifier.target.parse::<hyper::header::HeaderName>(), modifier.value.parse::<hyper::header::HeaderValue>()) {
+                        request.headers.insert(name, val);
+                    }
                 }
                 ModifierType::AddHeader => {
-                    if !request.headers.contains_key(&modifier.target) {
-                        request.headers.insert(modifier.target.clone(), modifier.value.clone());
+                    if let Ok(name) = modifier.target.parse::<hyper::header::HeaderName>() {
+                        if !request.headers.contains_key(&name) {
+                            if let Ok(val) = modifier.value.parse() {
+                                request.headers.insert(name, val);
+                            }
+                        }
                     }
                 }
                 ModifierType::RemoveHeader => {
-                    request.headers.remove(&modifier.target);
+                    if let Ok(name) = modifier.target.parse::<hyper::header::HeaderName>() {
+                        request.headers.remove(name);
+                    }
                 }
                 ModifierType::ReplaceHost => {
                     request.url = self.replace_url_host(&request.url, &modifier.value);
@@ -933,8 +943,8 @@ impl ReplayManager {
                     differences.push(Difference {
                         difference_type: DifferenceType::Header,
                         field_path: format!("headers.{}", key),
-                        original_value: Some(original_value.clone()),
-                        replayed_value: Some(replayed_value.clone()),
+                        original_value: original_value.to_str().ok().map(|s| s.to_string()),
+                        replayed_value: replayed_value.to_str().ok().map(|s| s.to_string()),
                         description: format!("Header '{}' values differ", key),
                     });
                     score -= 0.05;
@@ -943,7 +953,7 @@ impl ReplayManager {
                 differences.push(Difference {
                     difference_type: DifferenceType::MissingField,
                     field_path: format!("headers.{}", key),
-                    original_value: Some(original_value.clone()),
+                    original_value: original_value.to_str().ok().map(|s| s.to_string()),
                     replayed_value: None,
                     description: format!("Header '{}' missing in replayed response", key),
                 });
@@ -958,7 +968,7 @@ impl ReplayManager {
                     difference_type: DifferenceType::ExtraField,
                     field_path: format!("headers.{}", key),
                     original_value: None,
-                    replayed_value: replayed.headers.get(key).cloned(),
+                    replayed_value: replayed.headers.get(key).and_then(|v| v.to_str().ok()).map(|s| s.to_string()),
                     description: format!("Extra header '{}' in replayed response", key),
                 });
                 score -= 0.02;
@@ -1052,11 +1062,12 @@ impl ReplayManager {
                 true
             }
             FilterCondition::ContentTypeMatches(pattern) => {
-                if let Some(content_type) = request.headers.get("Content-Type") {
-                    self.wildcard_match(content_type, pattern)
-                } else {
-                    false
+                if let Some(content_type) = request.headers.get("content-type") {
+                    if let Ok(ct_str) = content_type.to_str() {
+                        return self.wildcard_match(ct_str, pattern);
+                    }
                 }
+                false
             }
             FilterCondition::And(conditions) => {
                 for condition in conditions {
@@ -1184,14 +1195,15 @@ impl ReplayManager {
     }
     
     /// 检查是否是文本内容
-    fn is_text_content(headers: &HashMap<String, String>) -> bool {
-        if let Some(content_type) = headers.get("Content-Type") {
-            content_type.starts_with("text/") || 
-            content_type.starts_with("application/json") ||
-            content_type.starts_with("application/xml")
-        } else {
-            false
+    fn is_text_content(headers: &hyper::HeaderMap) -> bool {
+        if let Some(content_type) = headers.get("content-type") {
+            if let Ok(ct_str) = content_type.to_str() {
+                return ct_str.starts_with("text/") || 
+                    ct_str.starts_with("application/json") ||
+                    ct_str.starts_with("application/xml");
+            }
         }
+        false
     }
     
     /// 截断字符串
@@ -1562,7 +1574,7 @@ mod tests {
         let manager = ReplayManager::new(api_port, config).await.unwrap();
         
         let mut request = HttpRequest::new("GET", "http://example.com/api");
-        request.headers.insert("Authorization".to_string(), "Bearer old_token".to_string());
+        request.headers.insert("Authorization".parse::<hyper::header::HeaderName>().unwrap(), "Bearer old_token".parse::<hyper::header::HeaderValue>().unwrap());
         
         let replay_config = ReplayConfig {
             request_modifiers: vec![
@@ -1616,8 +1628,8 @@ mod tests {
             status_code: 200,
             status_text: Some("OK".to_string()),
             headers: {
-                let mut h = HashMap::new();
-                h.insert("Content-Type".to_string(), "application/json".to_string());
+                let mut h = hyper::HeaderMap::new();
+                h.insert("Content-Type".parse::<hyper::header::HeaderName>().unwrap(), "application/json".parse::<hyper::header::HeaderValue>().unwrap());
                 h
             },
             body: b"{\"message\": \"hello\"}".to_vec(),
@@ -1629,8 +1641,8 @@ mod tests {
             status_code: 200,
             status_text: Some("OK".to_string()),
             headers: {
-                let mut h = HashMap::new();
-                h.insert("Content-Type".to_string(), "application/json".to_string());
+                let mut h = hyper::HeaderMap::new();
+                h.insert("Content-Type".parse::<hyper::header::HeaderName>().unwrap(), "application/json".parse::<hyper::header::HeaderValue>().unwrap());
                 h
             },
             body: b"{\"message\": \"hello\"}".to_vec(),

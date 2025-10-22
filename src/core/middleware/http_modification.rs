@@ -235,6 +235,7 @@ impl HttpModificationMiddleware {
             ModificationCondition::HeaderValueMatches { header, value } => {
                 if let Some(ref request) = context.request {
                     request.headers.get(header)
+                        .and_then(|v| v.to_str().ok())
                         .map(|v| self.wildcard_match(v, value))
                         .unwrap_or(false)
                 } else {
@@ -276,16 +277,24 @@ impl HttpModificationMiddleware {
                     self.apply_request_modification(context, modifications).await
                 }
                 ModificationAction::AddHeader { name, value } => {
-                    request.headers.insert(name.clone(), value.clone());
-                    self.update_headers_added_stats().await;
-                    Ok(true)
+                    if let (Ok(header_name), Ok(header_value)) = (name.parse::<hyper::header::HeaderName>(), value.parse::<hyper::header::HeaderValue>()) {
+                        request.headers.insert(header_name, header_value);
+                        self.update_headers_added_stats().await;
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
                 }
                 ModificationAction::RemoveHeader(header_name) => {
-                    let removed = request.headers.remove(header_name).is_some();
-                    if removed {
-                        self.update_headers_removed_stats().await;
+                    if let Ok(name) = header_name.parse::<hyper::header::HeaderName>() {
+                        let removed = request.headers.remove(name).is_some();
+                        if removed {
+                            self.update_headers_removed_stats().await;
+                        }
+                        Ok(removed)
+                    } else {
+                        Ok(false)
                     }
-                    Ok(removed)
                 }
                 ModificationAction::RewriteUrl { pattern, replacement } => {
                     let new_url = self.apply_url_rewrite(&request.url, pattern, replacement);
@@ -298,8 +307,12 @@ impl HttpModificationMiddleware {
                     }
                 }
                 ModificationAction::SetUserAgent(user_agent) => {
-                    request.headers.insert("User-Agent".to_string(), user_agent.clone());
-                    Ok(true)
+                    if let Ok(header_value) = user_agent.parse() {
+                        request.headers.insert("user-agent", header_value);
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
                 }
                 ModificationAction::NormalizeUrl => {
                     let normalized_url = self.normalize_url(&request.url);
@@ -313,8 +326,12 @@ impl HttpModificationMiddleware {
                 ModificationAction::AddAuth { username, password } => {
                     use base64::prelude::*;
                     let auth_value = format!("Basic {}", BASE64_STANDARD.encode(format!("{}:{}", username, password)));
-                    request.headers.insert("Authorization".to_string(), auth_value);
-                    Ok(true)
+                    if let Ok(header_value) = auth_value.parse() {
+                        request.headers.insert("authorization", header_value);
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
                 }
                 _ => Ok(false) // 其他动作不在请求阶段处理
             }
@@ -328,59 +345,55 @@ impl HttpModificationMiddleware {
         let mut modified = false;
         
         if let Some(ref mut request) = context.request {
-            // 修改URL
-            if let Some(ref new_url) = modifications.url {
-                request.url = new_url.clone();
+            // 添加头部
+            if let Some(ref add_headers) = modifications.add_headers {
+                for (name, value) in add_headers {
+                    if let (Ok(header_name), Ok(header_value)) = (name.parse::<hyper::header::HeaderName>(), value.parse::<hyper::header::HeaderValue>()) {
+                        request.headers.insert(header_name, header_value);
+                    }
+                }
                 modified = true;
             }
-            
+
+            // 移除头部
+            if let Some(ref remove_headers) = modifications.remove_headers {
+                for header in remove_headers {
+                    if let Ok(header_name) = header.parse::<hyper::header::HeaderName>() {
+                        if request.headers.remove(header_name).is_some() {
+                            modified = true;
+                        }
+                    }
+                }
+            }
+
+            // 修改头部
+            if let Some(ref modify_headers) = modifications.modify_headers {
+                for (name, value) in modify_headers {
+                    if let (Ok(header_name), Ok(header_value)) = (name.parse::<hyper::header::HeaderName>(), value.parse::<hyper::header::HeaderValue>()) {
+                        request.headers.insert(header_name, header_value);
+                    }
+                }
+                modified = true;
+            }
+
             // 修改方法
-            if let Some(ref new_method) = modifications.method {
+            if let Some(ref new_method) = modifications.change_method {
                 request.method = new_method.clone();
                 modified = true;
             }
-            
-            // 修改头部
-            if let Some(ref headers) = modifications.headers {
-                for (name, value) in headers {
-                    request.headers.insert(name.clone(), value.clone());
-                }
+
+            // 修改路径
+            if let Some(ref new_path) = modifications.change_path {
+                request.url = new_path.clone(); // 假设URL就是路径
                 modified = true;
             }
             
             // 修改请求体
-            if let Some(ref new_body) = modifications.body {
-                request.body = new_body.clone();
-                // 更新Content-Length
-                request.headers.insert("Content-Length".to_string(), new_body.len().to_string());
+            if let Some(ref new_body) = modifications.change_body {
+                let body_bytes = new_body.clone().into_bytes();
+                request.headers.insert("content-length", body_bytes.len().to_string().parse().unwrap());
+                request.body = body_bytes;
                 modified = true;
-            }
-            
-            // 移除头部
-            if let Some(ref remove_headers) = modifications.remove_headers {
-                for header in remove_headers {
-                    if request.headers.remove(header).is_some() {
-                        modified = true;
-                    }
-                }
-            }
-            
-            // 添加查询参数
-            if let Some(ref add_params) = modifications.add_query_params {
-                let new_url = self.add_query_params(&request.url, add_params)?;
-                if new_url != request.url {
-                    request.url = new_url;
-                    modified = true;
-                }
-            }
-            
-            // 移除查询参数
-            if let Some(ref remove_params) = modifications.remove_query_params {
-                let new_url = self.remove_query_params(&request.url, remove_params)?;
-                if new_url != request.url {
-                    request.url = new_url;
-                    modified = true;
-                }
             }
         }
         
@@ -476,6 +489,7 @@ impl HttpModificationMiddleware {
     }
     
     /// 添加查询参数
+    #[allow(dead_code)]
     fn add_query_params(&self, url: &str, params: &HashMap<String, String>) -> Result<String, AppError> {
         if let Ok(mut parsed_url) = url::Url::parse(url) {
             for (key, value) in params {
@@ -488,6 +502,7 @@ impl HttpModificationMiddleware {
     }
     
     /// 移除查询参数
+    #[allow(dead_code)]
     fn remove_query_params(&self, url: &str, params: &[String]) -> Result<String, AppError> {
         if let Ok(mut parsed_url) = url::Url::parse(url) {
             let mut new_pairs = Vec::new();
@@ -567,7 +582,6 @@ impl Middleware for HttpModificationMiddleware {
         "http_modification"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,

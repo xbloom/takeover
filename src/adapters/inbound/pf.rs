@@ -186,9 +186,19 @@ impl PfInboundAdapter {
             }
             Err(e) => {
                 debug!("Failed to parse protocol from stream: {}, using fallback", e);
-                // 解析失败时的回退策略：假设是HTTP（80端口）
-                let fallback_addr = SocketAddr::new(source_addr.ip(), 80);
-                (fallback_addr, "tcp", None, None)
+                // 解析失败时的回退策略：
+                // 由于 macOS 不支持 SO_ORIGINAL_DST，我们无法直接获取原始目标地址
+                // 但是可以通过 diocnatlook 系统调用查询 pfctl 的 NAT 表
+                // TODO: 实现 diocnatlook 系统调用
+                
+                // 临时方案：尝试从 pfctl 状态表查询原始目标
+                // 如果失败，则连接会在后续中间件中被拒绝
+                warn!("⚠️  无法从流中解析目标地址 ({}), 需要实现 diocnatlook 系统调用", e);
+                
+                // 返回源地址作为占位符，但标记为未知协议
+                // 这会导致连接失败，但至少不会误导到错误的目标
+                let fallback_addr = SocketAddr::new(source_addr.ip(), 0);
+                (fallback_addr, "unknown", None, None)
             }
         };
         

@@ -23,7 +23,7 @@ pub use tls::TlsMiddleware;
 // pub use http_parsing::HttpParsingMiddleware; //已经废弃
 pub use http1_stream::Http1StreamMiddleware;  // 新的HTTP/1.1流中间件
 pub use http2_stream::Http2StreamMiddleware;  // 新的HTTP/2流中间件
-pub use rule_matching::RuleMatchingMiddleware;
+pub use rule_matching::{RuleMatchingMiddleware, RuleService, DefaultAction};
 pub use http_modification::HttpModificationMiddleware;
 pub use script::ScriptMiddleware;
 pub use user_intervention::UserInterventionMiddleware;

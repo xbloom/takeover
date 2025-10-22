@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::collections::HashMap;
-use tracing::{debug, warn, error, instrument};
+use tracing::{debug, warn, error};
 use async_trait::async_trait;
 
 use crate::core::ports::{OutboundPort, NetworkStream, AppError};
@@ -146,7 +146,6 @@ impl CompositeOutboundAdapter {
     }
     
     /// 选择适配器并建立连接
-    #[instrument(skip(self, context))]
     async fn select_adapter_and_connect(
         &self, 
         context: &ConnectionContext
@@ -338,7 +337,7 @@ enum RoutingDecision {
 
 #[async_trait]
 impl OutboundPort for CompositeOutboundAdapter {
-    #[instrument(skip(self, context))]
+    // #[instrument(skip(self, context))]
     async fn connect(&self, context: &ConnectionContext) -> Result<Box<dyn NetworkStream>, AppError> {
         debug!("🔗 复合适配器开始连接: {}:{}", context.target_host, context.target_port);
         

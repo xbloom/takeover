@@ -139,7 +139,7 @@ async fn start_takeover_proxy_system(target_addr: SocketAddr) -> Result<SocketAd
     config.inbound.listen_port = 0; // 动态分配端口
     
     // 创建完整的中间件pipeline
-    let mut engine = ProcessingEngine::new();
+    let engine = ProcessingEngine::new();
     engine.add_middleware(Arc::new(TlsMiddleware::new()));
     engine.add_middleware(Arc::new(Http2StreamMiddleware::new()));
     engine.add_middleware(Arc::new(RuleMatchingMiddleware::new()));
@@ -152,13 +152,13 @@ async fn start_takeover_proxy_system(target_addr: SocketAddr) -> Result<SocketAd
     let event_port = Arc::new(TestEventPort::new());
     
     // 创建完整的AppCore
-    let app_core = AppCore::new(
+    let app_core = AppCore::builder(
         config,
         inbound_port.clone(),
         outbound_port,
         control_port,
         event_port,
-    );
+    ).build().await;
     
     // 启动代理监听
     let proxy_addr = start_proxy_listener(app_core, inbound_port).await?;

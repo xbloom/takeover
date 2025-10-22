@@ -4,7 +4,7 @@
 //! 
 //! 实际的业务逻辑位于 `crate::component::process_finder` 模块中
 
-use tracing::{warn, debug, instrument};
+use tracing::{warn, debug};
 use async_trait::async_trait;
 
 use crate::core::engine::{Middleware, MiddlewareResult};
@@ -82,7 +82,6 @@ impl Middleware for ProcessInfoMiddleware {
         "process_info"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,

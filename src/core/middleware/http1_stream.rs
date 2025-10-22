@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
 use tracing::{warn, error, debug, instrument};
 use async_trait::async_trait;
+use hyper::{HeaderMap, header::{HeaderName, HeaderValue}};
 
 use crate::core::engine::{Middleware, MiddlewareResult};
 use crate::core::model::{ConnectionContext, ProcessingState, HttpRequest};
@@ -331,11 +332,11 @@ impl Http1StreamMiddleware {
     }
     
     /// 读取HTTP头部
-    async fn read_headers<R>(&self, reader: &mut BufReader<R>) -> Result<(String, std::collections::HashMap<String, String>), TakeoverError>
+    async fn read_headers<R>(&self, reader: &mut BufReader<R>) -> Result<(String, HeaderMap), TakeoverError>
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut headers = std::collections::HashMap::new();
+        let mut headers = HeaderMap::new();
         let mut total_size = 0;
         let mut request_line = String::new();
         let mut first_line = true;
@@ -369,11 +370,18 @@ impl Http1StreamMiddleware {
                 break;
             }
             
-            // 解析头部字段
+            // 解析头部字段 - 使用 append 支持多值头部（如 Cookie）
             if let Some(colon_pos) = line.find(':') {
-                let name = line[..colon_pos].trim().to_lowercase();
-                let value = line[colon_pos + 1..].trim().to_string();
-                headers.insert(name, value);
+                let name = line[..colon_pos].trim();
+                let value = line[colon_pos + 1..].trim();
+                
+                // ✅ 使用 append 而不是 insert，支持多值头部
+                if let (Ok(header_name), Ok(header_value)) = (
+                    name.parse::<HeaderName>(),
+                    value.parse::<HeaderValue>()
+                ) {
+                    headers.append(header_name, header_value);
+                }
             }
         }
         
@@ -402,12 +410,15 @@ impl Http1StreamMiddleware {
     }
     
     /// 读取请求体
-    async fn read_request_body<R>(&self, reader: &mut BufReader<R>, headers: &std::collections::HashMap<String, String>) -> Result<Vec<u8>, TakeoverError>
+    async fn read_request_body<R>(&self, reader: &mut BufReader<R>, headers: &HeaderMap) -> Result<Vec<u8>, TakeoverError>
     where
         R: AsyncReadExt + Unpin,
     {
         // 检查Content-Length头部
-        if let Some(content_length_str) = headers.get("content-length") {
+        let content_length_str = headers.get("content-length")
+            .and_then(|v| v.to_str().ok());
+        
+        if let Some(content_length_str) = content_length_str {
             let content_length: usize = content_length_str.parse()
                 .map_err(|_| TakeoverError::Config("Invalid Content-Length header".to_string()))?;
             
@@ -504,7 +515,6 @@ impl Middleware for Http1StreamMiddleware {
         "http1_stream"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,

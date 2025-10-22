@@ -205,7 +205,9 @@ impl HttpClient {
         
         // 添加头部
         for (name, value) in &request.headers {
-            req_builder = req_builder.header(name, value);
+            if let Ok(v_str) = value.to_str() {
+                req_builder = req_builder.header(name.as_str(), v_str);
+            }
         }
         
         // 添加请求体
@@ -217,11 +219,12 @@ impl HttpClient {
         match req_builder.send().await {
             Ok(response) => {
                 let status_code = response.status().as_u16();
-                let headers: HashMap<String, String> = response
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or_default().to_string()))
-                    .collect();
+                let mut headers = hyper::HeaderMap::new();
+                for (k, v) in response.headers().iter() {
+                    if let (Ok(name), Ok(val)) = (k.as_str().parse::<hyper::header::HeaderName>(), v.to_str().unwrap_or_default().parse()) {
+                        headers.append(name, val);
+                    }
+                }
                 
                 let body = response.bytes().await
                     .map_err(|e| AppError::Config(format!("Failed to read response body: {}", e)))?

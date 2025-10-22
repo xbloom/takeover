@@ -8,9 +8,10 @@
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{warn, error, debug, instrument};
+use tracing::{warn, error, debug};
 use async_trait::async_trait;
 use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncBufReadExt, BufReader};
+use hyper::{HeaderMap, header::{HeaderName, HeaderValue}};
 
 use crate::core::engine::{Middleware, MiddlewareResult};
 use crate::core::model::{ConnectionContext, ProcessingState, HttpRequest, HttpResponse};
@@ -97,7 +98,6 @@ impl OutboundRequestMiddleware {
     }
     
     /// 执行HTTP请求转发
-    #[instrument(skip(self, context, core))]
     async fn forward_request(
         &self,
         context: &mut ConnectionContext,
@@ -302,12 +302,16 @@ impl OutboundRequestMiddleware {
         let host_header = self.build_host_header(context, protocol);
         http_request.push_str(&format!("Host: {}\r\n", host_header));
         
-        // 添加其他头部
-        for (name, value) in &request.headers {
+        // 添加其他头部 (HeaderMap 支持多值头部)
+        for (name, value) in request.headers.iter() {
             // 跳过某些头部，避免冲突
-            match name.to_lowercase().as_str() {
+            match name.as_str() {
                 "host" | "content-length" => continue,
-                _ => http_request.push_str(&format!("{}: {}\r\n", name, value)),
+                _ => {
+                    if let Ok(v) = value.to_str() {
+                        http_request.push_str(&format!("{}: {}\r\n", name.as_str(), v));
+                    }
+                }
             }
         }
         
@@ -375,16 +379,31 @@ impl OutboundRequestMiddleware {
     ) -> Result<HttpResponse, TakeoverError> {
         
         let mut reader = BufReader::new(stream);
-        let mut headers = std::collections::HashMap::new();
+        let mut headers = HeaderMap::new();
         let mut status_code = 200;
         let mut status_text = "OK".to_string();
         
         // 读取状态行
         let mut status_line = String::new();
         reader.read_line(&mut status_line).await
-            .map_err(|e| TakeoverError::Config(format!("Failed to read status line: {}", e)))?;
+            .map_err(|e| {
+                // UTF-8错误通常说明服务器返回了非HTTP响应（如直接返回二进制数据）
+                if e.to_string().contains("invalid utf-8") || e.to_string().contains("valid UTF-8") {
+                    TakeoverError::Config(format!(
+                        "Server returned non-HTTP response (binary data instead of HTTP headers). \
+                         This may indicate server-side protocol violation. URL may be returning raw binary. Error: {}", e
+                    ))
+                } else {
+                    TakeoverError::Config(format!("Failed to read status line: {}", e))
+                }
+            })?;
         
         let status_line = status_line.trim();
+        if status_line.is_empty() {
+            return Err(TakeoverError::Config(
+                "Empty HTTP status line received. Server may have closed connection or returned invalid response.".to_string()
+            ));
+        }
         debug!("📥 收到HTTP状态行: {}", status_line);
         
         // 解析状态行: HTTP/1.1 200 OK
@@ -412,8 +431,8 @@ impl OutboundRequestMiddleware {
             }
             
             if let Some(colon_pos) = header_line.find(':') {
-                let name = header_line[..colon_pos].trim().to_string();
-                let value = header_line[colon_pos + 1..].trim().to_string();
+                let name = header_line[..colon_pos].trim();
+                let value = header_line[colon_pos + 1..].trim();
                 
                 // 分析关键头部
                 match name.to_lowercase().as_str() {
@@ -436,7 +455,13 @@ impl OutboundRequestMiddleware {
                     _ => {}
                 }
                 
-                headers.insert(name, value);
+                // ✅ 使用 append 而不是 insert，支持多值头部（如 Set-Cookie）
+                if let (Ok(header_name), Ok(header_value)) = (
+                    name.parse::<HeaderName>(),
+                    value.parse::<HeaderValue>()
+                ) {
+                    headers.append(header_name, header_value);
+                }
             }
         }
         
@@ -631,7 +656,6 @@ impl Middleware for OutboundRequestMiddleware {
     }
     
     // #[instrument(skip(self, context, core), fields(conn = %context.id))]
-    #[instrument(skip(self, context, core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -694,7 +718,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_middleware_creation() {
-        let middleware = ForwardingMiddleware::new();
+        let middleware = OutboundRequestMiddleware::new();
         assert_eq!(middleware.name(), "forwarding");
         assert!(middleware.enabled());
         assert_eq!(middleware.priority(), 60);
@@ -708,7 +732,7 @@ mod tests {
     
     #[test]
     fn test_url_path_extraction() {
-        let middleware = ForwardingMiddleware::new();
+        let middleware = OutboundRequestMiddleware::new();
         
         assert_eq!(
             middleware.extract_path_from_url("http://example.com/path?query=1").unwrap(),
@@ -730,11 +754,11 @@ mod tests {
     
     #[test]
     fn test_http_request_building() {
-        let middleware = ForwardingMiddleware::new();
+        let middleware = OutboundRequestMiddleware::new();
         
         let mut request = HttpRequest::new("GET", "http://example.com/api/test?param=1");
-        request.headers.insert("User-Agent".to_string(), "test-agent".to_string());
-        request.headers.insert("Accept".to_string(), "application/json".to_string());
+        request.headers.insert("user-agent", "test-agent".parse().unwrap());
+        request.headers.insert("accept", "application/json".parse().unwrap());
         
         let connection = Connection::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),

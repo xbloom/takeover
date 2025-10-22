@@ -175,8 +175,6 @@ fn create_demo_config() -> AppConfig {
 async fn build_demo_app(config: AppConfig) -> Result<AppCore> {
     info!("🏗️ 构建HTTP/2 Direct Demo应用程序");
     
-    let config = Arc::new(config);
-    
     // 1. 创建适配器
     let inbound_adapter = create_inbound_adapter(&config).await?;
     let outbound_adapter = create_outbound_adapter(&config).await?;
@@ -185,16 +183,24 @@ async fn build_demo_app(config: AppConfig) -> Result<AppCore> {
     // 2. 创建简单的事件端口
     let event_port = Arc::new(SimpleEventPort::new());
     
-    // 3. 组装应用核心
-    let mut app_core = AppCore::new(
-        (*config).clone(),
+    // 3. 创建核心服务（RuleMatchingMiddleware 需要 StateManager）
+    use takeover::core::services::{StateManager, StateManagerConfig};
+    let state_manager = Arc::new(StateManager::new(StateManagerConfig::default()));
+    
+    // 4. 使用 Builder 模式构建 AppCore（推荐方式）
+    let mut app_core = AppCore::builder(
+        config,
         inbound_adapter,
         outbound_adapter,
         control_adapter,
         event_port,
-    );
+    )
+    .with_default_middlewares()  // 自动创建并注册默认中间件
+    .manage(state_manager)        // 注册 StateManager（必需，RuleMatchingMiddleware 依赖它）
+    .build()
+    .await;
     
-    // 4. 配置分流规则
+    // 5. 配置分流规则
     configure_routing_rules(&mut app_core).await?;
     
     info!("✅ Demo应用程序构建完成");
@@ -254,7 +260,7 @@ async fn create_inbound_adapter(
 ) -> Result<Arc<dyn takeover::core::ports::InboundPort>> {
     info!("📥 创建pfctl入站适配器");
     
-    let adapter = PfInboundAdapter::with_anchor_name("takeover_demo");
+    let adapter = PfInboundAdapter::with_anchor_name("takeover_transparent");
     
     info!("✅ pfctl入站适配器创建完成");
     Ok(Arc::new(adapter))

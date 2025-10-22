@@ -148,7 +148,7 @@ async fn test_complete_middleware_pipeline() -> Result<()> {
     info!("🏗️ 测试完整中间件管道");
     
     // 创建处理引擎
-    let mut engine = ProcessingEngine::new();
+    let engine = ProcessingEngine::new();
     
     // 添加核心中间件（按优先级顺序）
     engine.add_middleware(Arc::new(TlsMiddleware::new()));
@@ -197,7 +197,7 @@ async fn test_child_pipeline_factory() -> Result<()> {
     info!("🏭 测试子Pipeline工厂");
     
     // 创建处理引擎
-    let mut engine = ProcessingEngine::new();
+    let engine = ProcessingEngine::new();
     
     // 添加核心中间件
     engine.add_middleware(Arc::new(TlsMiddleware::new()));           // 优先级 10
@@ -269,7 +269,7 @@ async fn create_mock_app_core() -> Result<AppCore> {
     let control = Arc::new(MockControlPort);
     let event = Arc::new(MockEventPort);
     
-    Ok(AppCore::new(config, inbound, outbound, control, event))
+    Ok(AppCore::builder(config, inbound, outbound, control, event).build().await)
 }
 
 /// 创建完整配置的AppCore用于测试

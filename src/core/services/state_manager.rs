@@ -533,7 +533,7 @@ impl StateManager {
         }
         
         // 发送事件
-        self.emit_event(StateEvent {
+        self.emit_event_internal(StateEvent {
             event_type: StateEventType::ConnectionCreated,
             connection_id: Some(connection_id.clone()),
             session_id: None,
@@ -558,7 +558,7 @@ impl StateManager {
             state.last_activity = SystemTime::now();
             
             // 发送更新事件
-            self.emit_event(StateEvent {
+            self.emit_event_internal(StateEvent {
                 event_type: StateEventType::ConnectionUpdated,
                 connection_id: Some(connection_id.clone()),
                 session_id: None,
@@ -597,7 +597,7 @@ impl StateManager {
             }
             
             // 发送关闭事件
-            self.emit_event(StateEvent {
+            self.emit_event_internal(StateEvent {
                 event_type: StateEventType::ConnectionClosed,
                 connection_id: Some(connection_id.clone()),
                 session_id: None,
@@ -655,7 +655,7 @@ impl StateManager {
         }
         
         // 发送事件
-        self.emit_event(StateEvent {
+        self.emit_event_internal(StateEvent {
             event_type: StateEventType::SessionCreated,
             connection_id: None,
             session_id: Some(session_id.clone()),
@@ -680,7 +680,7 @@ impl StateManager {
             session.last_access = SystemTime::now();
             
             // 发送更新事件
-            self.emit_event(StateEvent {
+            self.emit_event_internal(StateEvent {
                 event_type: StateEventType::SessionUpdated,
                 connection_id: None,
                 session_id: Some(session_id.to_string()),
@@ -744,7 +744,7 @@ impl StateManager {
             if let Some(expires_at) = entry.expires_at {
                 if Instant::now() > expires_at {
                     cache.remove(key);
-                    self.emit_event(StateEvent {
+                    self.emit_event_internal(StateEvent {
                         event_type: StateEventType::CacheExpired,
                         connection_id: None,
                         session_id: None,
@@ -764,7 +764,7 @@ impl StateManager {
             entry.last_access = Instant::now();
             
             // 发送缓存命中事件
-            self.emit_event(StateEvent {
+            self.emit_event_internal(StateEvent {
                 event_type: StateEventType::CacheHit,
                 connection_id: None,
                 session_id: None,
@@ -780,7 +780,7 @@ impl StateManager {
             Some(entry.value.clone())
         } else {
             // 发送缓存未命中事件
-            self.emit_event(StateEvent {
+            self.emit_event_internal(StateEvent {
                 event_type: StateEventType::CacheMiss,
                 connection_id: None,
                 session_id: None,
@@ -863,8 +863,8 @@ impl StateManager {
         listeners.entry(event_type).or_insert_with(Vec::new).push(Box::new(listener));
     }
     
-    /// 发送事件
-    async fn emit_event(&self, event: StateEvent) {
+    /// 内部事件发送实现
+    async fn emit_event_internal(&self, event: StateEvent) {
         let event_type_str = format!("{:?}", event.event_type);
         let listeners = self.event_listeners.read().await;
         
@@ -880,6 +880,91 @@ impl StateManager {
                 listener(&event);
             }
         }
+    }
+    
+    // ========== 便捷方法：计数器操作 ==========
+    
+    /// 设置计数器值
+    pub async fn set_counter(&self, key: &str, value: u64) -> Result<(), AppError> {
+        self.set_cache(
+            key.to_string(),
+            serde_json::json!(value),
+            None, // 计数器不过期
+        ).await
+    }
+    
+    /// 获取计数器值
+    pub async fn get_counter(&self, key: &str) -> Result<u64, AppError> {
+        match self.get_cache(key).await {
+            Some(value) => {
+                value.as_u64()
+                    .ok_or_else(|| AppError::Config(format!("Counter {} is not a valid u64", key)))
+            }
+            None => Ok(0), // 不存在的计数器返回0
+        }
+    }
+    
+    /// 递增计数器
+    pub async fn increment_counter(&self, key: &str) -> Result<u64, AppError> {
+        let current = self.get_counter(key).await?;
+        let new_value = current + 1;
+        self.set_counter(key, new_value).await?;
+        Ok(new_value)
+    }
+    
+    /// 递减计数器
+    pub async fn decrement_counter(&self, key: &str) -> Result<u64, AppError> {
+        let current = self.get_counter(key).await?;
+        let new_value = current.saturating_sub(1);
+        self.set_counter(key, new_value).await?;
+        Ok(new_value)
+    }
+    
+    // ========== 便捷方法：全局数据操作 ==========
+    
+    /// 设置全局数据
+    pub async fn set_global_data(&self, key: &str, value: serde_json::Value) -> Result<(), AppError> {
+        self.set_cache(
+            format!("global:{}", key),
+            value,
+            None, // 全局数据不过期
+        ).await
+    }
+    
+    /// 获取全局数据
+    pub async fn get_global_data<T>(&self, key: &str) -> Option<T>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        let value = self.get_cache(&format!("global:{}", key)).await?;
+        serde_json::from_value(value).ok()
+    }
+    
+    // ========== 便捷方法：Gauge操作 ==========
+    
+    /// 设置Gauge值（浮点数指标）
+    pub async fn set_gauge(&self, key: &str, value: f64) -> Result<(), AppError> {
+        self.set_cache(
+            format!("gauge:{}", key),
+            serde_json::json!(value),
+            None,
+        ).await
+    }
+    
+    /// 获取Gauge值
+    pub async fn get_gauge(&self, key: &str) -> Result<f64, AppError> {
+        match self.get_cache(&format!("gauge:{}", key)).await {
+            Some(value) => {
+                value.as_f64()
+                    .ok_or_else(|| AppError::Config(format!("Gauge {} is not a valid f64", key)))
+            }
+            None => Ok(0.0),
+        }
+    }
+    
+    /// 发送事件（公开方法）
+    pub async fn emit_event(&self, event: StateEvent) {
+        self.emit_event_internal(event).await;
     }
     
     /// 获取连接列表

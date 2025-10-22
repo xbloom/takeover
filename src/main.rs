@@ -1,617 +1,271 @@
-// //! Takeover 透明代理应用程序入口点
-// //! 
-// //! 使用六边形架构和依赖注入来组装整个应用程序
-
-// use std::sync::Arc;
-// use std::time::Duration;
-// use std::path::PathBuf;
-
-// use clap::{Parser, Subcommand};
 use anyhow::Result;
-// use tracing::{info, warn, level_filters::LevelFilter};
-// use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use std::sync::Arc;
+use tokio::signal;
+use tracing::{ level_filters::LevelFilter, error};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use takeover::core::{AppCore, AppConfig};
+use takeover::core::model::TlsConfig;
+use takeover::core::services::{StateManager, StateManagerConfig, ReplayManager, ReplayManagerConfig};
+use takeover::adapters::inbound::pf::PfInboundAdapter;
+use takeover::adapters::outbound::composite::CompositeOutboundAdapter;
+use takeover::adapters::control::api::RestControlAdapter;
+use takeover::adapters::api::lua_api::{LuaApiAdapter, LuaApiConfig};
+use takeover::core::SimpleEventPort;
+use takeover::core::ports::ProxyConfig;
+use takeover::config::ProxyType;
+use takeover::user_manager::UserManager;
+use takeover::core::model::{Rule, RulePattern, RuleAction};
 
-// // 导入新架构组件
-// use takeover::core::{AppCore, AppConfig};
-// use takeover::core::services::{StateManager, StateManagerConfig, ReplayManager, ReplayManagerConfig};
-// use takeover::core::middleware::{
-//     TlsMiddleware, HttpParsingMiddleware, RuleMatchingMiddleware, 
-//     HttpModificationMiddleware, ScriptMiddleware, UserInterventionMiddleware, 
-//     ResponseMergeMiddleware
-// };
-
-// // 导入适配器
-// use takeover::adapters::{
-//     PfInboundAdapter, PfInboundConfig,
-//     DirectOutboundAdapter, Socks5OutboundAdapter,
-//     ApiControlAdapter, LuaScriptAdapter, LuaApiAdapter
-// };
-
-// // 导入配置和错误类型
-// use takeover::{Config, TakeoverError};
-
-// /// Takeover 透明代理命令行接口
-// #[derive(Parser)]
-// #[command(name = "takeover")]
-// #[command(about = "A powerful transparent proxy with advanced features")]
-// #[command(version = env!("CARGO_PKG_VERSION"))]
-// struct Cli {
-//     /// 配置文件路径
-//     #[arg(short, long, default_value = "takeover.toml")]
-//     config: PathBuf,
-    
-//     /// 日志级别
-//     #[arg(short, long, default_value = "info")]
-//     log_level: String,
-    
-//     /// 是否启用详细输出
-//     #[arg(short, long)]
-//     verbose: bool,
-    
-//     /// 命令
-//     #[command(subcommand)]
-//     command: Option<Commands>,
-// }
-
-// /// 可用的命令
-// #[derive(Subcommand)]
-// enum Commands {
-//     /// 启动透明代理服务
-//     Start {
-//         /// 监听端口
-//         #[arg(short, long, default_value = "8080")]
-//         port: u16,
-        
-//         /// 是否以守护进程模式运行
-//         #[arg(short, long)]
-//         daemon: bool,
-//     },
-    
-//     /// 停止透明代理服务
-//     Stop,
-    
-//     /// 重启透明代理服务
-//     Restart,
-    
-//     /// 显示服务状态
-//     Status,
-    
-//     /// 验证配置文件
-//     Validate,
-    
-//     /// 测试连接
-//     Test {
-//         /// 目标URL
-//         url: String,
-//     },
-    
-//     /// 管理重放会话
-//     Replay {
-//         #[command(subcommand)]
-//         action: ReplayCommands,
-//     },
-    
-//     /// 管理Lua脚本
-//     Script {
-//         #[command(subcommand)]
-//         action: ScriptCommands,
-//     },
-// }
-
-// /// 重放相关命令
-// #[derive(Subcommand)]
-// enum ReplayCommands {
-//     /// 列出录制会话
-//     List,
-//     /// 开始录制
-//     Record {
-//         /// 会话名称
-//         name: String,
-//     },
-//     /// 停止录制
-//     Stop {
-//         /// 会话ID
-//         session_id: String,
-//     },
-//     /// 重放会话
-//     Play {
-//         /// 录制会话ID
-//         session_id: String,
-//         /// 目标主机（可选）
-//         #[arg(long)]
-//         target_host: Option<String>,
-//     },
-// }
-
-// /// 脚本相关命令
-// #[derive(Subcommand)]
-// enum ScriptCommands {
-//     /// 列出脚本
-//     List,
-//     /// 加载脚本
-//     Load {
-//         /// 脚本文件路径
-//         file: PathBuf,
-//     },
-//     /// 验证脚本
-//     Validate {
-//         /// 脚本文件路径
-//         file: PathBuf,
-//     },
-// }
-
-// /// 应用程序构建器
-// /// 
-// /// 使用构建器模式和依赖注入来组装应用程序
-// pub struct AppBuilder {
-//     config: Config,
-//     app_config: AppConfig,
-// }
-
-// impl AppBuilder {
-//     /// 创建新的应用程序构建器
-//     pub fn new(config: Config) -> Self {
-//         let app_config = AppConfig {
-//             app_name: "takeover".to_string(),
-//             version: env!("CARGO_PKG_VERSION").to_string(),
-//             proxy_config: config.proxy_config.clone(),
-//             routing_rules: config.routing_engine.routing_rules.clone(),
-//             tls_config: config.tls_interception.clone(),
-//             user_config: config.user_manager.clone(),
-//         };
-        
-//         Self { config, app_config }
-//     }
-    
-//     /// 构建完整的应用程序
-//     pub async fn build(self) -> Result<AppCore, TakeoverError> {
-//         info!("🏗️ Building Takeover application with new architecture");
-        
-//         // 1. 创建核心服务
-//         let state_manager = self.build_state_manager().await?;
-//         let replay_manager = self.build_replay_manager().await?;
-        
-//         // 2. 创建适配器
-//         let inbound_adapter = self.build_inbound_adapter().await?;
-//         let outbound_adapter = self.build_outbound_adapter().await?;
-//         let control_adapter = self.build_control_adapter().await?;
-//         let script_adapter = self.build_script_adapter().await?;
-//         let api_adapter = self.build_api_adapter().await?;
-        
-//         // 3. 创建中间件管道
-//         let middlewares = self.build_middleware_pipeline(
-//             Arc::clone(&script_adapter),
-//             Arc::clone(&api_adapter),
-//         ).await?;
-        
-//         // 4. 组装核心应用
-//         let app_core = AppCore::new_with_all_ports(
-//             Arc::new(self.app_config),
-//             inbound_adapter,
-//             outbound_adapter,
-//             control_adapter,
-//             script_adapter,
-//             api_adapter,
-//             state_manager,
-//             replay_manager,
-//             middlewares,
-//         );
-        
-//         info!("✅ Application built successfully");
-//         Ok(app_core)
-//     }
-    
-//     /// 构建状态管理器
-//     async fn build_state_manager(&self) -> Result<Arc<StateManager>, TakeoverError> {
-//         info!("🗄️ Building state manager");
-        
-//         let config = StateManagerConfig {
-//             max_connections: 10000,
-//             max_sessions: 5000,
-//             connection_timeout: Duration::from_secs(3600),
-//             session_timeout: Duration::from_secs(7200),
-//             cleanup_interval: Duration::from_secs(60),
-//             enable_statistics: true,
-//             ..Default::default()
-//         };
-        
-//         let state_manager = StateManager::new(config);
-//         Ok(Arc::new(state_manager))
-//     }
-    
-//     /// 构建重放管理器
-//     async fn build_replay_manager(&self) -> Result<Arc<ReplayManager>, TakeoverError> {
-//         info!("🎬 Building replay manager");
-        
-//         // 这里需要一个API端口的引用，我们暂时使用Arc::new()的方式
-//         // 在实际的依赖注入中，这应该是从容器中获取的
-//         let api_adapter = Arc::new(LuaApiAdapter::new(Default::default()).unwrap());
-        
-//         let config = ReplayManagerConfig {
-//             storage_dir: PathBuf::from("./replay_data"),
-//             auto_recording: false,
-//             enable_result_comparison: true,
-//             ..Default::default()
-//         };
-        
-//         let replay_manager = ReplayManager::new(api_adapter, config).await
-//             .map_err(|e| TakeoverError::Config(format!("Failed to create replay manager: {}", e)))?;
-        
-//         Ok(Arc::new(replay_manager))
-//     }
-    
-//     /// 构建入站适配器
-//     async fn build_inbound_adapter(&self) -> Result<Arc<dyn takeover::core::ports::InboundPort>, TakeoverError> {
-//         info!("📥 Building inbound adapter");
-        
-//         let config = PfInboundConfig {
-//             listen_port: self.config.transparent_proxy.listen_port,
-//             bind_address: self.config.transparent_proxy.bind_ip.clone(),
-//             enable_ipv6: false,
-//             buffer_size: 8192,
-//             connection_timeout: Duration::from_secs(60),
-//             max_connections: 1000,
-//         };
-        
-//         let adapter = PfInboundAdapter::new(config).await
-//             .map_err(|e| TakeoverError::Config(format!("Failed to create inbound adapter: {}", e)))?;
-        
-//         Ok(Arc::new(adapter))
-//     }
-    
-//     /// 构建出站适配器
-//     async fn build_outbound_adapter(&self) -> Result<Arc<dyn takeover::core::ports::OutboundPort>, TakeoverError> {
-//         info!("📤 Building outbound adapter");
-        
-//         // 根据配置选择出站适配器
-//         match &self.config.proxy_config.proxy_type {
-//             takeover::ProxyType::Direct => {
-//                 let adapter = DirectOutboundAdapter::new();
-//                 Ok(Arc::new(adapter))
-//             }
-//             takeover::ProxyType::Socks5 => {
-//                 let adapter = Socks5OutboundAdapter::new(self.config.proxy_config.clone());
-//                 Ok(Arc::new(adapter))
-//             }
-//         }
-//     }
-    
-//     /// 构建控制适配器
-//     async fn build_control_adapter(&self) -> Result<Arc<dyn takeover::core::ports::ControlPort>, TakeoverError> {
-//         info!("🎛️ Building control adapter");
-        
-//         let adapter = ApiControlAdapter::new().await;
-//         Ok(Arc::new(adapter))
-//     }
-    
-//     /// 构建脚本适配器
-//     async fn build_script_adapter(&self) -> Result<Arc<dyn takeover::core::ports::ScriptPort>, TakeoverError> {
-//         info!("📜 Building script adapter");
-        
-//         // 这里同样需要API适配器的引用
-//         let api_adapter = Arc::new(LuaApiAdapter::new(Default::default()).unwrap());
-        
-//         let config = takeover::adapters::script::lua_adapter::LuaConfig {
-//             script_dir: PathBuf::from("./scripts"),
-//             max_concurrent_executions: 10,
-//             execution_timeout: Duration::from_secs(30),
-//             sandbox_enabled: true,
-//             auto_reload: false,
-//             ..Default::default()
-//         };
-        
-//         let adapter = LuaScriptAdapter::new(api_adapter, config).await
-//             .map_err(|e| TakeoverError::Config(format!("Failed to create script adapter: {}", e)))?;
-        
-//         Ok(Arc::new(adapter))
-//     }
-    
-//     /// 构建API适配器
-//     async fn build_api_adapter(&self) -> Result<Arc<dyn takeover::core::ports::ApiPort>, TakeoverError> {
-//         info!("🔌 Building API adapter");
-        
-//         let config = takeover::adapters::api::lua_api::LuaApiConfig {
-//             allowed_domains: vec![], // 允许所有域名
-//             enable_request_logging: true,
-//             ..Default::default()
-//         };
-        
-//         let adapter = LuaApiAdapter::new(config)
-//             .map_err(|e| TakeoverError::Config(format!("Failed to create API adapter: {}", e)))?;
-        
-//         Ok(Arc::new(adapter))
-//     }
-    
-//     /// 构建中间件管道
-//     async fn build_middleware_pipeline(
-//         &self,
-//         script_adapter: Arc<dyn takeover::core::ports::ScriptPort>,
-//         api_adapter: Arc<dyn takeover::core::ports::ApiPort>,
-//     ) -> Result<Vec<Arc<dyn takeover::core::engine::Middleware>>, TakeoverError> {
-//         info!("🔧 Building middleware pipeline");
-        
-//         let mut middlewares: Vec<Arc<dyn takeover::core::engine::Middleware>> = Vec::new();
-        
-//         // 1. TLS中间件 (优先级: 10)
-//         if self.config.tls_interception.enabled {
-//             let tls_middleware = TlsMiddleware::new(self.config.tls_interception.clone()).await
-//                 .map_err(|e| TakeoverError::Config(format!("Failed to create TLS middleware: {}", e)))?;
-//             middlewares.push(Arc::new(tls_middleware));
-//         }
-        
-//         // 2. HTTP解析中间件 (优先级: 20)
-//         let http_parsing_middleware = HttpParsingMiddleware::new();
-//         middlewares.push(Arc::new(http_parsing_middleware));
-        
-//         // 3. 规则匹配中间件 (优先级: 30)
-//         let rule_matching_middleware = RuleMatchingMiddleware::new(
-//             self.config.routing_engine.routing_rules.clone()
-//         );
-//         middlewares.push(Arc::new(rule_matching_middleware));
-        
-//         // 4. 脚本中间件 (优先级: 35)
-//         let script_middleware = ScriptMiddleware::new(script_adapter, Arc::clone(&api_adapter));
-//         middlewares.push(Arc::new(script_middleware));
-        
-//         // 5. HTTP修改中间件 (优先级: 40)
-//         let http_modification_middleware = HttpModificationMiddleware::new();
-//         middlewares.push(Arc::new(http_modification_middleware));
-        
-//         // 6. 用户干预中间件 (优先级: 45)
-//         let user_intervention_config = takeover::core::middleware::user_intervention::UserInterventionConfig {
-//             enabled: true,
-//             default_timeout: Duration::from_secs(300),
-//             require_authentication: false, // 简化配置
-//             ..Default::default()
-//         };
-//         let user_intervention_middleware = UserInterventionMiddleware::new(user_intervention_config);
-//         middlewares.push(Arc::new(user_intervention_middleware));
-        
-//         // 7. 响应合并中间件 (优先级: 50)
-//         let response_merge_config = takeover::core::middleware::response_merge::ResponseMergeConfig {
-//             enabled: true,
-//             ..Default::default()
-//         };
-//         let response_merge_middleware = ResponseMergeMiddleware::new(
-//             Arc::clone(&api_adapter), 
-//             response_merge_config
-//         ).await.map_err(|e| TakeoverError::Config(format!("Failed to create response merge middleware: {}", e)))?;
-//         middlewares.push(Arc::new(response_merge_middleware));
-        
-//         // 按优先级排序
-//         middlewares.sort_by_key(|m| m.priority());
-        
-//         info!("✅ Built middleware pipeline with {} middlewares", middlewares.len());
-//         for middleware in &middlewares {
-//             info!("  - {} (priority: {})", middleware.name(), middleware.priority());
-//         }
-        
-//         Ok(middlewares)
-//     }
-// }
-
-// /// 初始化日志系统
-// fn init_logging(log_level: &str, verbose: bool) -> Result<()> {
-//     let level = match log_level.to_lowercase().as_str() {
-//         "trace" => LevelFilter::TRACE,
-//         "debug" => LevelFilter::DEBUG,
-//         "info" => LevelFilter::INFO,
-//         "warn" => LevelFilter::WARN,
-//         "error" => LevelFilter::ERROR,
-//         _ => LevelFilter::INFO,
-//     };
-    
-//     let env_filter = if verbose {
-//         EnvFilter::from_default_env()
-//             .add_directive(level.into())
-//             .add_directive("takeover=trace".parse()?)
-//     } else {
-//         EnvFilter::from_default_env()
-//             .add_directive(level.into())
-//     };
-    
-//     tracing_subscriber::registry()
-//         .with(fmt::layer().with_target(verbose).with_thread_ids(verbose))
-//         .with(env_filter)
-//         .init();
-    
-//     Ok(())
-// }
-
-// /// 加载配置文件
-// fn load_config(config_path: &PathBuf) -> Result<Config> {
-//     if config_path.exists() {
-//         info!("📖 Loading configuration from: {}", config_path.display());
-//         Config::from_file(config_path)
-//             .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))
-//     } else {
-//         warn!("⚠️ Configuration file not found, using defaults");
-//         Ok(Config::default())
-//     }
-// }
-
-/// 主函数
 #[tokio::main]
 async fn main() -> Result<()> {
-//     let cli = Cli::parse();
+    // 1. 初始化日志系统
     
-//     // 初始化日志
-//     init_logging(&cli.log_level, cli.verbose)?;
+    // 设置特定模块的日志级别（避免过多调试日志）
+    let module_log_levels: Vec<&'static str> = vec![
+        "takeover::components::process_finder=info",
+        "takeover::core::middleware::forwarding=info",
+        // 可以在这里继续添加更多模块
+        // "takeover::core::middleware::http2_stream=info",
+        // "takeover::adapters::outbound::socks5=info",
+    ];
     
-//     info!("🚀 Starting Takeover Transparent Proxy v{}", env!("CARGO_PKG_VERSION"));
+    let mut env_filter = EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy();
     
-//     // 加载配置
-//     let config = load_config(&cli.config)?;
+    for directive in module_log_levels {
+        env_filter = env_filter.add_directive(directive.parse().unwrap());
+    }
     
-//     match cli.command {
-//         Some(Commands::Start { port, daemon }) => {
-//             start_service(config, port, daemon).await
-//         }
-//         Some(Commands::Stop) => {
-//             stop_service().await
-//         }
-//         Some(Commands::Restart) => {
-//             restart_service().await
-//         }
-//         Some(Commands::Status) => {
-//             show_status().await
-//         }
-//         Some(Commands::Validate) => {
-//             validate_config(config).await
-//         }
-//         Some(Commands::Test { url }) => {
-//             test_connection(url).await
-//         }
-//         Some(Commands::Replay { action }) => {
-//             handle_replay_commands(action, config).await
-//         }
-//         Some(Commands::Script { action }) => {
-//             handle_script_commands(action, config).await
-//         }
-//         None => {
-//             // 默认启动服务
-//             start_service(config, 8080, false).await
-//         }
-//     }
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_target(true)           // 显示模块路径
+                .with_thread_ids(false)      // 不显示线程ID
+                .with_span_events(fmt::format::FmtSpan::NONE)  // 不显示span事件
+                // 不使用compact()，默认格式会显示span fields (conn, proc)
+                // span层级由最外层的handle_connection_lifecycle提供conn和proc
+                // 中间件不再使用instrument，避免嵌套层级过深
+        )
+        .with(env_filter)
+        .init();
+
+    
+    println!("\n🌐 Takeover 透明代理 v2.1");
+    println!("=====================================");
+
+    // 2. 检查用户权限
+    let user_manager = UserManager::new();
+    if !user_manager.is_admin() {
+        println!("⚠️  需要管理员权限 (sudo)");
+        println!("   继续运行可能会失败...");
+    }
+
+    // 3. 构建应用配置
+    let mut config = AppConfig::default();
+    config.inbound.intercepted_ports = vec![443, 80];
+    config.inbound.bypass_user = Some("_takeover_proxy".to_string());
+    config.tls = TlsConfig {
+        enabled: true,
+        interception_mode: "selective".to_string(),
+        intercept_domains: vec![
+            "*".to_string(),
+            // "*.org".to_string(),  // 拦截所有 .org 域名
+            // "*.com".to_string(),  // 拦截所有 .com 域名
+            // "*.net".to_string(),  // 拦截所有 .net 域名
+            // "*.cn".to_string(),   // 拦截所有 .cn 域名
+        ],
+        cert_store_path: None,
+        cert_cache_duration: 3600,
+        max_concurrent_handshakes: 100,
+        auto_install_ca: true,
+    };
+    let config = Arc::new(config);
+    println!("✅ 配置: 拦截端口 {:?}, TLS拦截 {}", 
+        config.inbound.intercepted_ports,
+        config.tls.interception_mode);
+
+    // 4. 构建核心服务
+    let state_manager = Arc::new(StateManager::new(StateManagerConfig::default()));
+    let api_adapter = Arc::new(LuaApiAdapter::new(LuaApiConfig::default())?);
+    let replay_manager = Arc::new(ReplayManager::new(
+        api_adapter.clone(), 
+        ReplayManagerConfig::default()
+    ).await?);
+
+    // 5. 构建端口适配器
+    let inbound_port = Arc::new(PfInboundAdapter::default());
+    let socks5_proxy = ProxyConfig {
+        url: "socks5://127.0.0.1:7897".to_string(),
+        proxy_type: ProxyType::Socks5,
+        auth: None,
+    };
+    let outbound_port = Arc::new(CompositeOutboundAdapter::with_socks5_config(socks5_proxy));
+    let ctrl = RestControlAdapter::default();
+    let control_port = Arc::new(ctrl);
+    let event_port = Arc::new(SimpleEventPort::new());
+    println!("✅ 适配器: PfInbound + CompositeOutbound (Direct/SOCKS5)");
+    
+
+    // 6. 组装 AppCore
+    let app_core = Arc::new(AppCore::builder(
+        (*config).clone(),
+        inbound_port,
+        outbound_port,
+        control_port,
+        event_port,
+    )
+    .with_api_port(api_adapter)
+    .with_default_middlewares()
+    .manage(state_manager)
+    .manage(replay_manager)
+    .build()
+    .await);
+    
+    // 6.5 🎯 设置全局AppCore单例 (类似Tauri的全局AppHandle)
+    // 这样所有middleware、adapter都可以通过AppCore::global()访问
+    AppCore::set_global(app_core.clone())?;
+    println!("✅ 全局AppCore已注册 (任何组件都可通过AppCore::global()访问)");
+    
+    // 6.6 注册中间件服务（包括 RuleService、TlsService）
+    app_core.register_middleware_services().await?;
+    
+    // 🔍 验证TLS Service是否成功注册
+    use takeover::core::services::TlsService;
+    let has_tls = app_core.has_service::<TlsService>().await;
+    println!("✅ 中间件服务已注册 (RuleService 可用, TlsService: {})", has_tls);
+    
+    // 7. 配置路由规则
+    configure_routing_rules(&app_core).await?;
+    println!("✅ AppCore: 中间件管道 + 路由规则 已就绪");
+
+    // 8. 启动主服务
+    println!("\n💡 测试: curl https://httpbin.org/get");
+    println!("🚀 启动透明代理服务...\n");
+    
+    let app_core_clone = Arc::clone(&app_core);
+    
+    // 使用 tokio::select! 来并发运行服务器和等待信号
+    let result = tokio::select! {
+        run_result = app_core.run() => {
+            match run_result {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    error!("❌ 运行失败: {}", e);
+                    println!("❌ 失败: {} (提示: 使用sudo运行)", e);
+                    Err(e.into())
+                }
+            }
+        }
+        
+        _ = signal::ctrl_c() => {
+            println!("\n🛑 Ctrl+C 收到，正在关闭...");
+            app_core_clone.request_stop().await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            println!("✅ 已停止");
+            Ok(())
+        }
+    };
+
+    result
+}
+
+/// 配置路由分流规则
+async fn configure_routing_rules(app_core: &AppCore) -> Result<()> {
+    let rules = vec![
+        // 🌐 httpbin.org 域名走 SOCKS5 代理
+        Rule::new(
+            "httpbin.org",
+            "httpbin.org (包括子域名)",
+            RulePattern::Or(vec![
+                RulePattern::HostMatches("httpbin.org".to_string()),
+                RulePattern::HostMatches("*.httpbin.org".to_string()),
+            ]),
+            RuleAction::ProxyByName("default".to_string()),
+            10,
+        ),
+        // 🌐 Google 全球域名走 SOCKS5 代理（包括国际域名 .com.hk, .co.jp 等）
+        Rule::new(
+            "google_all_domains_proxy",
+            "Google全球域名代理规则",
+            RulePattern::HostMatches("*google*".to_string()),
+            RuleAction::ProxyByName("default".to_string()),
+            11,
+        ),
+        // // 🔧 curl 程序走 SOCKS5 代理
+        // Rule::new(
+        //     "curl_proxy",
+        //     "curl程序代理规则", 
+        //     RulePattern::ProcessMatches("*curl*".to_string()),
+        //     RuleAction::ProxyByName("default".to_string()),
+        //     20,
+        // ),
+        // 🔄 默认直连规则（兜底）
+        Rule::new(
+            "default_direct",
+            "默认直连规则",
+            RulePattern::HostMatches("*".to_string()),
+            RuleAction::Direct,
+            100,
+        ),
+    ];
+    
+    // 应用规则（RestControlAdapter 会自动同步到 RuleService）
+    app_core.control_port().apply_rules(rules).await
+        .map_err(|e| anyhow::anyhow!("Failed to apply rules: {}", e))?;
+    
+    println!("✅ 路由规则配置完成:");
+    println!("   1. *.httpbin.org → SOCKS5 代理 (优先级: 10)");
+    println!("   2. *google.* → SOCKS5 代理 (优先级: 11)");
+    println!("   3. curl 进程 → SOCKS5 代理 (优先级: 20)");
+    println!("   4. 其他流量 → 直连 (优先级: 100)");
+    println!("\n🔒 pf规则已排除本地和内网地址，防止循环");
+    
     Ok(())
 }
 
-// /// 启动服务
-// async fn start_service(config: Config, port: u16, daemon: bool) -> Result<()> {
-//     info!("🌟 Starting Takeover proxy service on port {}", port);
-    
-//     if daemon {
-//         info!("👤 Running as daemon");
-//         // TODO: 实现守护进程模式
-//     }
-    
-//     // 构建应用程序
-//     let app_builder = AppBuilder::new(config);
-//     let app_core = app_builder.build().await?;
-    
-//     // 启动应用程序
-//     info!("🎯 Starting application core");
-//     app_core.run().await
-//         .map_err(|e| anyhow::anyhow!("Application failed: {}", e))?;
-    
-//     Ok(())
-// }
-
-// /// 停止服务
-// async fn stop_service() -> Result<()> {
-//     info!("🛑 Stopping Takeover proxy service");
-//     // TODO: 实现服务停止逻辑
-//     Ok(())
-// }
-
-// /// 重启服务
-// async fn restart_service() -> Result<()> {
-//     info!("🔄 Restarting Takeover proxy service");
-//     stop_service().await?;
-//     // TODO: 重新启动逻辑
-//     Ok(())
-// }
-
-// /// 显示服务状态
-// async fn show_status() -> Result<()> {
-//     info!("📊 Checking Takeover proxy service status");
-//     // TODO: 实现状态检查逻辑
-//     println!("Service status: Running");
-//     Ok(())
-// }
-
-// /// 验证配置
-// async fn validate_config(config: Config) -> Result<()> {
-//     info!("✅ Validating configuration");
-    
-//     // 验证配置的有效性
-//     if config.transparent_proxy.listen_port == 0 {
-//         return Err(anyhow::anyhow!("Invalid listen port: 0"));
-//     }
-    
-//     if config.routing_engine.routing_rules.domains.is_empty() 
-//         && config.routing_engine.routing_rules.ports.is_empty() {
-//         warn!("⚠️ No routing rules configured, all traffic will be proxied");
-//     }
-    
-//     println!("✅ Configuration is valid");
-//     Ok(())
-// }
-
-// /// 测试连接
-// async fn test_connection(url: String) -> Result<()> {
-//     info!("🧪 Testing connection to: {}", url);
-    
-//     // 简单的连接测试
-//     let client = reqwest::Client::new();
-//     match client.get(&url).send().await {
-//         Ok(response) => {
-//             println!("✅ Connection successful: {} {}", response.status(), url);
-//         }
-//         Err(e) => {
-//             println!("❌ Connection failed: {}", e);
-//         }
-//     }
-    
-//     Ok(())
-// }
-
-// /// 处理重放相关命令
-// async fn handle_replay_commands(action: ReplayCommands, config: Config) -> Result<()> {
-//     match action {
-//         ReplayCommands::List => {
-//             info!("📋 Listing recorded sessions");
-//             // TODO: 实现会话列表功能
-//             println!("No recorded sessions found");
-//         }
-//         ReplayCommands::Record { name } => {
-//             info!("🔴 Starting recording session: {}", name);
-//             // TODO: 实现录制开始功能
-//         }
-//         ReplayCommands::Stop { session_id } => {
-//             info!("⏹️ Stopping recording session: {}", session_id);
-//             // TODO: 实现录制停止功能
-//         }
-//         ReplayCommands::Play { session_id, target_host } => {
-//             info!("▶️ Playing back session: {}", session_id);
-//             if let Some(host) = target_host {
-//                 info!("🎯 Target host: {}", host);
-//             }
-//             // TODO: 实现重放功能
-//         }
-//     }
-//     Ok(())
-// }
-
-// /// 处理脚本相关命令
-// async fn handle_script_commands(action: ScriptCommands, config: Config) -> Result<()> {
-//     match action {
-//         ScriptCommands::List => {
-//             info!("📋 Listing available scripts");
-//             // TODO: 实现脚本列表功能
-//             let scripts_dir = PathBuf::from("./scripts");
-//             if scripts_dir.exists() {
-//                 if let Ok(entries) = std::fs::read_dir(scripts_dir) {
-//                     for entry in entries {
-//                         if let Ok(entry) = entry {
-//                             if entry.path().extension().and_then(|s| s.to_str()) == Some("lua") {
-//                                 println!("📜 {}", entry.file_name().to_string_lossy());
-//                             }
-//                         }
-//                     }
-//                 }
-//             } else {
-//                 println!("No scripts directory found");
-//             }
-//         }
-//         ScriptCommands::Load { file } => {
-//             info!("📂 Loading script: {}", file.display());
-//             // TODO: 实现脚本加载功能
-//         }
-//         ScriptCommands::Validate { file } => {
-//             info!("✅ Validating script: {}", file.display());
-//             // TODO: 实现脚本验证功能
-//         }
-//     }
-//     Ok(())
-// }
+// ========================================
+// 🏗️ 六边形架构设计说明
+// ========================================
+//
+// 本程序完全遵循六边形架构（Hexagonal Architecture）原则：
+//
+// 1. **核心业务逻辑**（AppCore）
+//    - 独立于外部技术栈
+//    - 通过端口接口与外界交互
+//    - 配置驱动，声明式风格
+//
+// 2. **端口接口**（Ports）
+//    - InboundPort: 接收外部连接
+//    - OutboundPort: 建立出站连接
+//    - ControlPort: 提供控制接口
+//    - EventPort: 事件发布订阅
+//    - ScriptPort: 脚本扩展
+//
+// 3. **适配器实现**（Adapters）
+//    - PfInboundAdapter: macOS pfctl 实现
+//    - Socks5OutboundAdapter: SOCKS5 代理实现
+//    - RestControlAdapter: REST API 实现
+//    - LuaScriptAdapter: Lua 脚本实现
+//
+// 4. **中间件管道**（Middleware Pipeline）
+//    - 可插拔的处理链
+//    - 每个中间件职责单一
+//    - 按优先级顺序执行
+//
+// 5. **配置驱动**
+//    - 所有行为通过 AppConfig 声明
+//    - 不直接操作内部组件
+//    - 易于测试和扩展
+//
+// 关键特性：
+// - ✅ 业务逻辑与技术实现解耦
+// - ✅ 易于单元测试（可替换适配器）
+// - ✅ 灵活扩展（新增端口/适配器）
+// - ✅ 清晰的依赖方向（向内依赖）
+//
+// 与 Demo 的对比：
+// - Demo: 直接操作 TransparentServer、TlsManager（Raw API）
+// - Main: 通过 AppCore + Ports + Adapters（六边形架构）
+//
+// ========================================

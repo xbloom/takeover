@@ -711,19 +711,16 @@ impl ResponseMergeMiddleware {
         let additional_responses = &responses[1..];
         
         let result = match strategy {
-            MergeStrategy::ReplaceBody => {
+            MergeStrategy::Replace => {
                 self.merge_replace_body(primary_response, additional_responses).await
             }
-            MergeStrategy::AppendBody => {
+            MergeStrategy::Append => {
                 self.merge_append_body(primary_response, additional_responses).await
             }
-            MergeStrategy::MergeJson => {
+            MergeStrategy::Merge => {
                 self.merge_json_responses(primary_response, additional_responses, metadata).await
             }
-            MergeStrategy::MergeHeaders => {
-                self.merge_headers_only(primary_response, additional_responses).await
-            }
-            MergeStrategy::CustomScript => {
+            MergeStrategy::Custom(_) => {
                 self.merge_with_custom_script(primary_response, additional_responses, metadata).await
             }
         };
@@ -740,7 +737,7 @@ impl ResponseMergeMiddleware {
         
         if let Some(last_response) = additional.last() {
             merged.body = last_response.body.clone();
-            merged.headers.insert("Content-Length".to_string(), merged.body.len().to_string());
+            merged.headers.insert("content-length", merged.body.len().to_string().parse().unwrap());
         }
         
         Ok(merged)
@@ -754,7 +751,7 @@ impl ResponseMergeMiddleware {
             merged.body.extend(&response.body);
         }
         
-        merged.headers.insert("Content-Length".to_string(), merged.body.len().to_string());
+        merged.headers.insert("content-length", merged.body.len().to_string().parse().unwrap());
         Ok(merged)
     }
     
@@ -785,8 +782,8 @@ impl ResponseMergeMiddleware {
         
         let mut merged_response = primary.clone();
         merged_response.body = merged_body;
-        merged_response.headers.insert("Content-Type".to_string(), "application/json".to_string());
-        merged_response.headers.insert("Content-Length".to_string(), merged_response.body.len().to_string());
+        merged_response.headers.insert("content-type", "application/json".parse().unwrap());
+        merged_response.headers.insert("content-length", merged_response.body.len().to_string().parse().unwrap());
         
         // 更新性能指标
         metadata.performance_metrics.raw_data_size = total_size;
@@ -826,13 +823,15 @@ impl ResponseMergeMiddleware {
     }
     
     /// 仅合并头部
+    #[allow(dead_code)]
     async fn merge_headers_only(&self, primary: &HttpResponse, additional: &[HttpResponse]) -> Result<HttpResponse, AppError> {
         let mut merged = primary.clone();
         
         for response in additional {
             for (key, value) in &response.headers {
                 // 避免覆盖重要的头部
-                if !key.to_lowercase().starts_with("content-") && key.to_lowercase() != "server" {
+                let key_str = key.as_str();
+                if !key_str.to_lowercase().starts_with("content-") && key_str.to_lowercase() != "server" {
                     merged.headers.insert(key.clone(), value.clone());
                 }
             }
@@ -907,8 +906,12 @@ impl ResponseMergeMiddleware {
                 let mut key_parts = Vec::new();
                 for field in fields {
                     if let Some(ref request) = context.request {
-                        if let Some(value) = request.headers.get(field) {
-                            key_parts.push(format!("{}:{}", field, value));
+                        if let Ok(header_name) = field.parse::<hyper::header::HeaderName>() {
+                            if let Some(value) = request.headers.get(&header_name) {
+                                if let Ok(v) = value.to_str() {
+                                    key_parts.push(format!("{}:{}", field, v));
+                                }
+                            }
                         }
                     }
                 }
@@ -1028,7 +1031,7 @@ impl Default for ResponseMergeConfig {
                 max_entries: 1000,
                 key_strategy: CacheKeyStrategy::UrlBased,
             },
-            default_strategy: MergeStrategy::MergeJson,
+            default_strategy: MergeStrategy::Merge,
             enabled_strategies: vec![
                 "json".to_string(),
                 "headers".to_string(),
@@ -1221,7 +1224,7 @@ impl MergeStrategyHandler for AppendMergeStrategy {
             merged.body.extend(&response.body);
         }
         
-        merged.headers.insert("Content-Length".to_string(), merged.body.len().to_string());
+        merged.headers.insert("content-length", merged.body.len().to_string().parse().unwrap());
         Ok(merged)
     }
     
@@ -1244,7 +1247,6 @@ impl Middleware for ResponseMergeMiddleware {
         "response_merge"
     }
     
-    #[instrument(skip(self, context, _core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,
@@ -1279,6 +1281,8 @@ impl Middleware for ResponseMergeMiddleware {
 
 #[cfg(test)]
 mod tests {
+    use hyper::HeaderMap;
+
     use super::*;
     use crate::core::model::{Connection, HttpRequest};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1318,7 +1322,7 @@ mod tests {
         let primary_response = HttpResponse {
             status_code: 200,
             status_text: Some("OK".to_string()),
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
             body: br#"{"name": "John", "age": 30}"#.to_vec(),
             id: None,
             sent_at: None,
@@ -1327,7 +1331,7 @@ mod tests {
         let additional_response = HttpResponse {
             status_code: 200,
             status_text: Some("OK".to_string()),
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
             body: br#"{"city": "New York", "age": 31}"#.to_vec(),
             id: None,
             sent_at: None,
@@ -1354,7 +1358,7 @@ mod tests {
         let primary_response = HttpResponse {
             status_code: 200,
             status_text: Some("OK".to_string()),
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
             body: b"Hello ".to_vec(),
             id: None,
             sent_at: None,
@@ -1363,7 +1367,7 @@ mod tests {
         let additional_response = HttpResponse {
             status_code: 200,
             status_text: Some("OK".to_string()),
-            headers: HashMap::new(),
+            headers: HeaderMap::new(),
             body: b"World!".to_vec(),
             id: None,
             sent_at: None,
@@ -1372,7 +1376,7 @@ mod tests {
         let result = middleware.merge_append_body(&primary_response, &[additional_response]).await.unwrap();
         
         assert_eq!(String::from_utf8_lossy(&result.body), "Hello World!");
-        assert_eq!(result.headers.get("Content-Length").unwrap(), "12");
+        assert_eq!(result.headers.get("content-length").unwrap().to_str().unwrap(), "12");
     }
     
     #[tokio::test]

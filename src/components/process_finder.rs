@@ -70,6 +70,7 @@ pub struct ProcessFinderStats {
 
 /// 网络协议类型
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum NetworkProtocol {
     Tcp,
     Udp,

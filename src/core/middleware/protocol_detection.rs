@@ -211,7 +211,7 @@ impl ProtocolDetectionMiddleware {
     /// 检测进程是否使用SSL Pinning
     /// 
     /// 检查进程名是否在SSL Pinning白名单中，如果是则应该直接透传
-    #[instrument(skip(self, context))]
+    // #[instrument(skip(self, context))]
     fn is_ssl_pinning_process(&self, context: &ConnectionContext) -> bool {
         if !self.config.enable_process_detection {
             return false;
@@ -345,7 +345,7 @@ impl ProtocolDetectionMiddleware {
     }
     
     /// 启动Copy Pipe透传
-    #[instrument(skip(self, client_stream, context, core))]
+    // #[instrument(skip(self, client_stream, context, core))]
     async fn start_copy_pipe(
         &self,
         client_stream: TcpStream,
@@ -387,7 +387,7 @@ impl ProtocolDetectionMiddleware {
     }
     
     /// 双向数据拷贝
-    #[instrument(skip(self, client_stream, server_stream, context))]
+    // #[instrument(skip(self, client_stream, server_stream, context))]
     async fn bidirectional_copy(
         &self,
         mut client_stream: TcpStream,
@@ -529,6 +529,8 @@ impl Default for ProtocolDetectionConfig {
             "nsurlsessiond",          // macOS网络会话守护进程
             
             "App Store",
+            "QQ",
+            "mihomo",
             "amsengagementd",         // Apple Media Services engagement
             "amsaccountsd",
             "appstoreagent",
@@ -560,7 +562,7 @@ impl Middleware for ProtocolDetectionMiddleware {
         "protocol_detection"
     }
     
-    #[instrument(skip(self, context, core))]
+    // #[instrument(skip(self, context, core))]
     async fn process(
         &self,
         context: &mut ConnectionContext,

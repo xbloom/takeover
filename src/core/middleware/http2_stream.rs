@@ -19,7 +19,7 @@ use bytes::Bytes;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioExecutor};
-use tokio_rustls::{server::TlsStream as InboundTlsStream};
+use tokio_rustls::server::TlsStream as InboundTlsStream;
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
@@ -365,7 +365,8 @@ impl Http2StreamMiddleware {
         skip(req, parent_context, core, stats), 
         fields(
             conn = %parent_context.id, 
-            proc = parent_context.connection.metadata.process_name
+            proc = %parent_context.connection.metadata.process_name.as_deref().unwrap_or("unknown")
+
         )
     )]
     async fn spawn_child_pipeline_static(
@@ -463,21 +464,16 @@ impl Http2StreamMiddleware {
     
     /// 转换hyper请求为我们的HttpRequest
     async fn convert_hyper_request_static(req: Request<Incoming>) -> Result<HttpRequest, TakeoverError> {
-        let method = req.method().to_string();
-        let uri = req.uri().to_string();
-        let version = format!("{:?}", req.version());
+        // ✅ 直接使用 hyper 的 HeaderMap（支持多值头部）
+        let (parts, body) = req.into_parts();
         
-        // 转换头部
-        let mut headers = std::collections::HashMap::new();
-        for (name, value) in req.headers() {
-            headers.insert(
-                name.to_string(),
-                value.to_str().unwrap_or("").to_string()
-            );
-        }
+        let method = parts.method.to_string();
+        let uri = parts.uri.to_string();
+        let version = format!("{:?}", parts.version);
+        let headers = parts.headers;
         
         // 读取请求体
-        let body_bytes = match http_body_util::BodyExt::collect(req.into_body()).await {
+        let body_bytes = match http_body_util::BodyExt::collect(body).await {
             Ok(collected) => collected.to_bytes().to_vec(),
             Err(e) => {
                 warn!("读取请求体失败: {}", e);
@@ -486,7 +482,7 @@ impl Http2StreamMiddleware {
         };
         
         Ok(HttpRequest {
-            id: Some(Uuid::new_v4()),
+            id: Some(Uuid::new_v4().to_string()),
             method,
             url: uri,
             version,
@@ -545,8 +541,8 @@ impl Http2StreamMiddleware {
             let mut builder = Response::builder()
                 .status(response.status_code as u16);
             
-            // 添加头部
-            for (key, value) in response.headers {
+            // ✅ 添加头部 - HeaderMap 自动支持多值头部
+            for (key, value) in response.headers.iter() {
                 builder = builder.header(key, value);
             }
             
