@@ -1063,7 +1063,8 @@ impl TlsInterceptionManager {
                     debug!("自动安装已禁用，根CA证书将在首次使用时生成");
                 }
                 let cert = self.cert_manager.get_or_generate_cert("www.aowuwu.com").await?;
-                debug!("TLS拦截环境初始化完成: ca_cert_path={:?}", cert);
+                let short = format!("{:?}", cert).chars().take(10).collect::<String>();
+                debug!("TLS拦截环境初始化完成: ca_cert_path={}", short);
                 Ok(())
             }
         }

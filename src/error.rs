@@ -1,5 +1,11 @@
 use thiserror::Error;
 
+impl From<mlua::Error> for TakeoverError {
+    fn from(err: mlua::Error) -> Self {
+        TakeoverError::Lua(err.to_string())
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum TakeoverError {
     #[error("Configuration error: {0}")]
@@ -24,7 +30,7 @@ pub enum TakeoverError {
     Script(String),
     
     #[error("Lua error: {0}")]
-    Lua(#[from] mlua::Error),
+    Lua(String),
     
     #[error("Permission denied: {0}")]
     PermissionDenied(String),

@@ -248,6 +248,14 @@ impl DirectOutboundAdapter {
     
     /// 检查是否需要TLS连接
     fn needs_tls_connection(&self, context: &ConnectionContext) -> bool {
+        // 🔧 Copy Pipe模式：强制使用纯TCP连接
+        if let Some(force_tcp) = context.custom_data.get("force_tcp_only") {
+            if force_tcp.as_bool() == Some(true) {
+                debug!("🔗 检测到force_tcp_only标记，跳过TLS连接");
+                return false;
+            }
+        }
+        
         // 检查自定义数据中的协议信息
         if let Some(protocol) = context.custom_data.get("original_target_protocol") {
             if let Some(protocol_str) = protocol.as_str() {

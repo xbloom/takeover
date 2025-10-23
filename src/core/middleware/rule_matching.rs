@@ -117,15 +117,16 @@ impl RuleService {
         }
     }
 
-    /// 应用规则 (完整版) - 包含预编译、缓存清理和StateManager同步
+    /// 应用规则 (Upsert语义) - 包含预编译、缓存清理和StateManager同步
+    /// 
+    /// **Upsert语义**: 如果规则ID存在则更新，不存在则插入。不会删除未传入的规则。
     pub async fn apply_rules(&self, rules: Vec<Rule>) -> Result<(), RuleServiceError> {
-        info!("🔧 Applying {} rules to RuleService", rules.len());
-        let start_time = Instant::now();
+        info!("🔧 Applying {} rules to RuleService (Upsert)", rules.len());
+        let start_time: Instant = Instant::now();
 
-        // 1. 预编译所有规则
+        // 1. 预编译所有规则（锁外操作，避免阻塞）
         let mut compiled_rules_map = HashMap::new();
         let mut rules_map = HashMap::new();
-        let mut priority_map: BTreeMap<i32, Vec<String>> = BTreeMap::new();
         
         for rule in &rules {
             match self.compile_rule(rule).await {
@@ -137,38 +138,91 @@ impl RuleService {
                 }
             }
             
-            // 构建HashMap和优先级索引
             rules_map.insert(rule.id.clone(), rule.clone());
-            priority_map
-                .entry(rule.priority)
-                .or_insert_with(Vec::new)
-                .push(rule.id.clone());
         }
         
         let compiled_count = compiled_rules_map.len();
         let backup_id = format!("backup_{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs());
 
-        // 2. 原子更新内存状态
+        // 2. 读取现有规则，在锁外构建完整的优先级索引（性能优化）
+        let priority_map = {
+            let active_rules = self.active_rules.read().await;
+            let mut priority_map: BTreeMap<i32, Vec<String>> = BTreeMap::new();
+            
+            // 先添加现有规则到索引
+            for (id, rule) in active_rules.iter() {
+                priority_map
+                    .entry(rule.priority)
+                    .or_insert_with(Vec::new)
+                    .push(id.clone());
+            }
+            
+            // 再upsert新规则到索引（如果规则已存在，需要先移除旧优先级）
+            for (id, rule) in &rules_map {
+                // 移除旧优先级条目（如果存在）
+                if let Some(old_rule) = active_rules.get(id) {
+                    if old_rule.priority != rule.priority {
+                        // 优先级变了，需要从旧优先级列表中移除
+                        if let Some(old_list) = priority_map.get_mut(&old_rule.priority) {
+                            old_list.retain(|rid| rid != id);
+                            if old_list.is_empty() {
+                                priority_map.remove(&old_rule.priority);
+                            }
+                        }
+                    } else {
+                        // 优先级没变，从列表中移除（后面会重新添加）
+                        if let Some(list) = priority_map.get_mut(&rule.priority) {
+                            list.retain(|rid| rid != id);
+                        }
+                    }
+                }
+                
+                // 添加到新优先级
+                priority_map
+                    .entry(rule.priority)
+                    .or_insert_with(Vec::new)
+                    .push(id.clone());
+            }
+            
+            priority_map
+        };
+
+        // 3. 快速原子更新内存状态（最小化持锁时间）
         {
             let mut active_rules = self.active_rules.write().await;
             let mut compiled = self.compiled_rules.write().await;
             let mut index = self.priority_index.write().await;
             
-            *active_rules = rules_map;
-            *compiled = compiled_rules_map;
+            // Upsert规则
+            for (id, rule) in rules_map {
+                active_rules.insert(id, rule);
+            }
+            
+            // Upsert编译缓存
+            for (id, compiled_rule) in compiled_rules_map {
+                compiled.insert(id, compiled_rule);
+            }
+            
+            // 原子替换优先级索引（已在锁外构建好）
             *index = priority_map;
         }
 
-        // 3. 清理匹配缓存
+        // 4. 获取总规则数（用于统计）
+        let total_rules_count = {
+            let active_rules = self.active_rules.read().await;
+            active_rules.len()
+        };
+
+        // 5. 清理匹配缓存（失效所有缓存的匹配结果）
         {
             let mut cache = self.match_cache.lock().await;
             cache.clear();
         }
 
-        // 4. 异步同步到StateManager (不阻塞热路径)
+        // 6. 异步同步到StateManager (不阻塞热路径)
         let state_manager = self.state_manager.clone();
         let rules_snapshot = rules.clone();
-        let rule_count = rules.len();
+        let upserted_count = rules.len();
         
         tokio::spawn(async move {
             // 存储规则快照
@@ -176,8 +230,8 @@ impl RuleService {
                 let _ = state_manager.set_global_data("rules_snapshot", snapshot_data).await;
             }
             
-            // 更新统计信息
-            let _ = state_manager.set_counter("active_rules_count", rule_count as u64).await;
+            // 更新统计信息（使用总规则数）
+            let _ = state_manager.set_counter("active_rules_count", total_rules_count as u64).await;
             let _ = state_manager.increment_counter("rule_updates_total").await;
             
             // 发布规则更新事件
@@ -187,7 +241,8 @@ impl RuleService {
                 session_id: None,
                 data: {
                     let mut data = HashMap::new();
-                    data.insert("rule_count".to_string(), serde_json::json!(rule_count));
+                    data.insert("total_rules_count".to_string(), serde_json::json!(total_rules_count));
+                    data.insert("upserted_count".to_string(), serde_json::json!(upserted_count));
                     data.insert("update_timestamp".to_string(),
                         serde_json::json!(SystemTime::now()
                             .duration_since(UNIX_EPOCH)
@@ -201,8 +256,9 @@ impl RuleService {
 
         let apply_duration = start_time.elapsed();
         info!(
-            "✅ Rules applied successfully: {} rules, {} compiled, backup_id: {}, duration: {}ms",
-            rules.len(),
+            "✅ Rules applied successfully: {} upserted, {} total rules, {} compiled, backup_id: {}, duration: {}ms",
+            upserted_count,
+            total_rules_count,
             compiled_count,
             backup_id,
             apply_duration.as_millis()
@@ -213,6 +269,69 @@ impl RuleService {
     /// 获取活跃规则
     pub async fn get_active_rules(&self) -> Vec<Rule> {
         self.active_rules.read().await.values().cloned().collect()
+    }
+
+    /// 删除规则
+    pub async fn delete_rule(&self, rule_id: &str) -> Result<(), RuleServiceError> {
+        info!("🗑️ Deleting rule: {}", rule_id);
+        
+        // 1. 删除规则和编译缓存
+        {
+            let mut active_rules = self.active_rules.write().await;
+            let mut compiled = self.compiled_rules.write().await;
+            
+            let rule_deleted = active_rules.remove(rule_id).is_some();
+            compiled.remove(rule_id);
+            
+            if !rule_deleted {
+                return Err(RuleServiceError::RuleValidationFailed(
+                    format!("Rule {} not found", rule_id)
+                ));
+            }
+            
+            // 2. 重建优先级索引
+            let mut index = self.priority_index.write().await;
+            index.clear();
+            for (id, rule) in active_rules.iter() {
+                index
+                    .entry(rule.priority)
+                    .or_insert_with(Vec::new)
+                    .push(id.clone());
+            }
+        }
+        
+        // 3. 清理匹配缓存
+        {
+            let mut cache = self.match_cache.lock().await;
+            cache.clear();
+        }
+        
+        // 4. 更新统计信息
+        let total_rules_count = {
+            let active_rules = self.active_rules.read().await;
+            active_rules.len()
+        };
+        
+        let state_manager = self.state_manager.clone();
+        let rule_id_string = rule_id.to_string();
+        tokio::spawn(async move {
+            let _ = state_manager.set_counter("active_rules_count", total_rules_count as u64).await;
+            let _ = state_manager.emit_event(StateEvent {
+                event_type: StateEventType::Custom("rule_deleted".to_string()),
+                connection_id: None,
+                session_id: None,
+                data: {
+                    let mut data = HashMap::new();
+                    data.insert("rule_id".to_string(), serde_json::json!(rule_id_string));
+                    data.insert("total_rules_count".to_string(), serde_json::json!(total_rules_count));
+                    data
+                },
+                timestamp: SystemTime::now(),
+            }).await;
+        });
+        
+        info!("✅ Rule deleted: {} (total: {})", rule_id, total_rules_count);
+        Ok(())
     }
 
     /// 完整规则匹配 - 支持所有模式和条件

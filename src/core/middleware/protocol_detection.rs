@@ -369,7 +369,7 @@ impl ProtocolDetectionMiddleware {
         Ok(())
     }
     
-    /// 连接到目标服务器
+    /// 连接到目标服务器（Copy Pipe专用：纯TCP连接，不做TLS）
     async fn connect_to_target(
         &self,
         context: &ConnectionContext,
@@ -377,12 +377,21 @@ impl ProtocolDetectionMiddleware {
     ) -> Result<Box<dyn crate::core::ports::NetworkStream>, TakeoverError> {
         debug!("连接到目标服务器: {}:{}", context.target_host, context.target_port);
         
+        // 🔧 关键修复：Copy Pipe需要纯TCP连接，不做TLS
+        // 创建一个新的context副本，标记为纯TCP模式
+        let mut copy_pipe_context = context.clone();
+        copy_pipe_context.custom_data.insert(
+            "force_tcp_only".to_string(),
+            serde_json::json!(true)
+        );
+        debug!("🔗 Copy Pipe模式：强制使用纯TCP连接（不建立TLS）");
+        
         // 使用出站适配器建立连接
         let outbound_port = core.outbound_port();
-        let stream = outbound_port.connect(context).await
+        let stream = outbound_port.connect(&copy_pipe_context).await
             .map_err(|e| TakeoverError::Config(format!("Failed to connect to target: {}", e)))?;
         
-        debug!("✅ 成功建立到目标服务器的连接: {}:{}", context.target_host, context.target_port);
+        debug!("✅ 成功建立到目标服务器的纯TCP连接: {}:{}", context.target_host, context.target_port);
         Ok(stream)
     }
     

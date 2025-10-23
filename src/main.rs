@@ -8,7 +8,7 @@ use takeover::core::model::TlsConfig;
 use takeover::core::services::{StateManager, StateManagerConfig, ReplayManager, ReplayManagerConfig};
 use takeover::adapters::inbound::pf::PfInboundAdapter;
 use takeover::adapters::outbound::composite::CompositeOutboundAdapter;
-use takeover::adapters::control::api::RestControlAdapter;
+use takeover::adapters::control::{ControlService, HttpApiServer};
 use takeover::adapters::api::lua_api::{LuaApiAdapter, LuaApiConfig};
 use takeover::core::SimpleEventPort;
 use takeover::core::ports::ProxyConfig;
@@ -101,8 +101,7 @@ async fn main() -> Result<()> {
         auth: None,
     };
     let outbound_port = Arc::new(CompositeOutboundAdapter::with_socks5_config(socks5_proxy));
-    let ctrl = RestControlAdapter::default();
-    let control_port = Arc::new(ctrl);
+    let control_port = Arc::new(ControlService::default());
     let event_port = Arc::new(SimpleEventPort::new());
     println!("✅ 适配器: PfInbound + CompositeOutbound (Direct/SOCKS5)");
     
@@ -112,13 +111,14 @@ async fn main() -> Result<()> {
         (*config).clone(),
         inbound_port,
         outbound_port,
-        control_port,
+        control_port.clone(),
         event_port,
     )
     .with_api_port(api_adapter)
     .with_default_middlewares()
     .manage(state_manager)
     .manage(replay_manager)
+    .manage(control_port)  // 注册 ControlService 到服务容器
     .build()
     .await);
     
@@ -139,7 +139,17 @@ async fn main() -> Result<()> {
     configure_routing_rules(&app_core).await?;
     println!("✅ AppCore: 中间件管道 + 路由规则 已就绪");
 
-    // 8. 启动主服务
+    // 8. 启动 HTTP API 服务器
+    let http_server = HttpApiServer::default();
+    if let Err(e) = http_server.start().await {
+        error!("❌ HTTP API 服务器启动失败: {}", e);
+    } else {
+        println!("✅ HTTP API 服务器已启动: http://127.0.0.1:8768");
+        #[cfg(feature = "openapi")]
+        println!("   📚 Swagger UI: http://127.0.0.1:8768/swagger-ui");
+    }
+
+    // 9. 启动主服务
     println!("\n💡 测试: curl https://httpbin.org/get");
     println!("🚀 启动透明代理服务...\n");
     
@@ -210,7 +220,7 @@ async fn configure_routing_rules(app_core: &AppCore) -> Result<()> {
         ),
     ];
     
-    // 应用规则（RestControlAdapter 会自动同步到 RuleService）
+    // 应用规则（ControlService 会自动同步到 RuleService）
     app_core.control_port().apply_rules(rules).await
         .map_err(|e| anyhow::anyhow!("Failed to apply rules: {}", e))?;
     
@@ -245,7 +255,7 @@ async fn configure_routing_rules(app_core: &AppCore) -> Result<()> {
 // 3. **适配器实现**（Adapters）
 //    - PfInboundAdapter: macOS pfctl 实现
 //    - Socks5OutboundAdapter: SOCKS5 代理实现
-//    - RestControlAdapter: REST API 实现
+//    - ControlService: Rust API 实现
 //    - LuaScriptAdapter: Lua 脚本实现
 //
 // 4. **中间件管道**（Middleware Pipeline）

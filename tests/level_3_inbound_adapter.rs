@@ -132,7 +132,7 @@ async fn test_adapter_status_management() -> Result<()> {
     // 创建简单配置用于测试
     let config = InboundConfig {
         listen_address: "127.0.0.1".to_string(),
-        listen_port: 18081,
+        listen_port: 8768,
         max_connections: 10,
         buffer_size: 4096,
         timeout: Duration::from_secs(10),

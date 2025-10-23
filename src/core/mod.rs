@@ -1133,6 +1133,9 @@ impl AppCoreBuilder {
             } else if let Ok(replay_manager) = service.clone().downcast::<services::ReplayManager>() {
                 app_core.services.register_arc(replay_manager).await;
                 info!("✅ ReplayManager registered via builder");
+            } else if let Ok(control_service) = service.clone().downcast::<crate::adapters::control::ControlService>() {
+                app_core.services.register_arc(control_service).await;
+                info!("✅ ControlService registered via builder");
             }
             // 可以继续添加其他服务类型的判断
         }
@@ -1197,6 +1200,22 @@ mod tests {
             unimplemented!()
         }
         async fn get_active_rules(&self) -> Result<Vec<Rule>, AppError> { Ok(vec![]) }
+        
+        async fn get_rules_by_name(&self, name_pattern: &str) -> Result<Vec<Rule>, AppError> {
+            todo!()
+        }
+        
+        async fn get_rule_by_id(&self, id: &str) -> Result<Option<Rule>, AppError> {
+            todo!()
+        }
+        
+        async fn upsert_rule(&self, rule: Rule) -> Result<Rule, AppError> {
+            todo!()
+        }
+        
+        async fn delete_rule(&self, id: &str) -> Result<(), AppError> {
+            todo!()
+        }
     }
     
     #[async_trait::async_trait]

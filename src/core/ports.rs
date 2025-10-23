@@ -103,8 +103,23 @@ pub trait OutboundPort: Send + Sync {
 /// ```
 #[async_trait]
 pub trait ControlPort: Send + Sync {
-    /// 应用规则配置
+    /// 应用规则配置（upsert语义：存在则更新，不存在则插入）
     async fn apply_rules(&self, rules: Vec<Rule>) -> Result<(), AppError>;
+    
+    /// 获取当前规则（支持按 name 或 id 过滤）
+    async fn get_active_rules(&self) -> Result<Vec<Rule>, AppError>;
+    
+    /// 按名称模糊查询规则（支持部分匹配）
+    async fn get_rules_by_name(&self, name_pattern: &str) -> Result<Vec<Rule>, AppError>;
+    
+    /// 按ID查询规则（精确匹配）
+    async fn get_rule_by_id(&self, id: &str) -> Result<Option<Rule>, AppError>;
+    
+    /// 创建或更新单个规则（upsert语义）
+    async fn upsert_rule(&self, rule: Rule) -> Result<Rule, AppError>;
+    
+    /// 删除规则
+    async fn delete_rule(&self, id: &str) -> Result<(), AppError>;
     
     /// 获取活跃连接列表
     async fn get_active_connections(&self) -> Result<Vec<ConnectionSummary>, AppError>;
@@ -128,9 +143,6 @@ pub trait ControlPort: Send + Sync {
         request_id: RequestId, 
         modifications: RequestModifications
     ) -> Result<ReplayResult, AppError>;
-    
-    /// 获取当前规则
-    async fn get_active_rules(&self) -> Result<Vec<Rule>, AppError>;
 }
 
 /// 事件端口：负责将核心产生的领域事件发布出去

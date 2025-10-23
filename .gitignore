@@ -88,4 +88,5 @@ test_*.sh
 callgrind.out.*
 perf.data*
 
-
+# nodejs
+node_modules/

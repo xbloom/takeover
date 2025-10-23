@@ -490,6 +490,7 @@ impl HttpResponse {
 
 /// 连接状态
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum ConnectionStatus {
     /// 连接中
     Connecting,
@@ -513,10 +514,12 @@ pub enum ConnectionStatus {
 
 /// 连接摘要
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ConnectionSummary {
     /// 连接ID
     pub id: ConnectionId,
     /// 源地址
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub source_addr: SocketAddr,
     /// 目标主机
     pub target_host: String,
@@ -531,8 +534,10 @@ pub struct ConnectionSummary {
     /// 接收字节数
     pub bytes_received: u64,
     /// 创建时间
+    #[cfg_attr(feature = "openapi", schema(value_type = String))]
     pub created_at: SystemTime,
     /// 最后活动时间
+    #[cfg_attr(feature = "openapi", schema(value_type = Option<String>))]
     pub last_activity: Option<SystemTime>,
 }
 
@@ -555,17 +560,47 @@ pub struct AdapterStatus {
 // Phase 2: 完整版规则数据模型 (V3 Design)
 // =======================================================================
 
+// 默认值生成函数（用于 serde 反序列化）
+fn default_rule_name() -> String {
+    "unnamed_rule".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_priority() -> i32 {
+    50  // 默认中等优先级
+}
+
 /// 规则定义 - 完整版本
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Rule {
-    pub id: String,  // 使用 utils::generate_short_connection_id()
+    /// 规则ID（自动生成）
+    #[serde(default = "generate_short_connection_id")]
+    pub id: String,
+    /// 规则名称（默认为 "unnamed_rule"）
+    #[serde(default = "default_rule_name")]
     pub name: String,
+    /// 规则描述（默认为空字符串）
+    #[serde(default)]
     pub description: String,
+    /// 匹配模式（必需）
     pub pattern: RulePattern,
+    /// 额外条件（默认为空数组）
+    #[serde(default)]
     pub conditions: Vec<RuleCondition>,
+    /// 执行动作（必需）
     pub action: RuleAction,
+    /// 是否启用（默认为 true）
+    #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 优先级（默认为 50）
+    #[serde(default = "default_priority")]
     pub priority: i32,
+    /// 元数据（默认为空 HashMap）
+    #[serde(default)]
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
@@ -592,6 +627,7 @@ impl Rule {
 
 /// 规则匹配模式 - 完整版本
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum RulePattern {
     // 基础匹配
     HostMatches(String),              // 主机匹配：*.google.com
@@ -612,9 +648,12 @@ pub enum RulePattern {
     },
     WeekdayMatches(Vec<u8>),         // 星期几：[1,2,3,4,5] (Mon-Fri)
     
-    // 复合匹配
+    // 复合匹配 - 使用 value_type 打破递归循环
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<Object>))]
     And(Vec<RulePattern>),           // 逻辑与
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<Object>))]
     Or(Vec<RulePattern>),            // 逻辑或
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
     Not(Box<RulePattern>),           // 逻辑非
     
     // 高级匹配
@@ -623,6 +662,7 @@ pub enum RulePattern {
 
 /// 规则条件 - 补充匹配条件
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RuleCondition {
     pub name: String,
     pub condition_type: RuleConditionType,
@@ -632,6 +672,7 @@ pub struct RuleCondition {
 
 /// 规则条件类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum RuleConditionType {
     // 网络条件
     SourceIPInRange,     // 源IP范围
@@ -656,6 +697,7 @@ pub enum RuleConditionType {
 
 /// 规则动作 - 完整版本
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum RuleAction {
     // 基础动作
     Allow,                           // 允许通过 (无修改)
@@ -686,6 +728,7 @@ pub enum RuleAction {
 
 /// 请求修改配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RequestModifications {
     pub add_headers: Option<HashMap<String, String>>,
     pub remove_headers: Option<Vec<String>>,
@@ -697,6 +740,7 @@ pub struct RequestModifications {
 
 /// 响应修改配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ResponseModifications {
     pub change_status: Option<u16>,
     pub add_headers: Option<HashMap<String, String>>,
@@ -707,6 +751,7 @@ pub struct ResponseModifications {
 
 /// 复合请求配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct CompositeRequestConfig {
     pub additional_requests: Vec<HttpRequestConfig>,
     pub merge_strategy: MergeStrategy,
@@ -715,6 +760,7 @@ pub struct CompositeRequestConfig {
 
 /// HTTP请求配置 (用于复合请求)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct HttpRequestConfig {
     pub url: String,
     pub method: String,
@@ -745,6 +791,7 @@ impl From<HttpRequestConfig> for HttpRequest {
 
 /// 合并策略
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum MergeStrategy {
     Replace,           // 使用新响应替换
     Merge,            // 合并响应内容
@@ -754,6 +801,7 @@ pub enum MergeStrategy {
 
 /// 日志级别
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum LogLevel {
     Debug,
     Info,
@@ -763,6 +811,7 @@ pub enum LogLevel {
 
 /// 告警配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct AlertConfig {
     pub alert_type: AlertType,
     pub message: String,
@@ -772,6 +821,7 @@ pub struct AlertConfig {
 
 /// 告警类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum AlertType {
     SecurityThreat,
     PerformanceIssue,
@@ -782,6 +832,7 @@ pub enum AlertType {
 
 /// 告警严重级别
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum AlertSeverity {
     Low,
     Medium,
